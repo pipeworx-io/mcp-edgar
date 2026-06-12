@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/edgar",
-  "title": "edgar",
+  "title": "Edgar",
   "description": "EDGAR MCP — SEC EDGAR public APIs (free, no auth)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/edgar",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-edgar",
