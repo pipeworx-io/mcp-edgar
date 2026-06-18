@@ -149,6 +149,19 @@ const tools: McpToolExport['tools'] = [
     },
   },
   {
+    name: 'edgar_fund_holdings',
+    description:
+      "AUTHORITATIVE portfolio holdings of a US ETF or mutual fund (SEC Form N-PORT) — what the fund actually owns. Pass the FUND's ticker (e.g. \"ARKK\", \"QQQ\", \"VTI\", \"VOO\", \"IVV\"). Returns the latest monthly portfolio: net assets, holdings count, and top positions by weight — each with name, CUSIP, value (USD), and % of fund. Use for \"what does ARKK hold\", \"top holdings of QQQ\", \"is $STOCK in VTI\". Distinct from edgar_institutional_holdings (13F = what an investment MANAGER like Berkshire owns); this is a registered fund's own N-PORT. Covers US-registered open-end funds + ETFs; data is ~30-60 days delayed. Note: a few legacy ETFs structured as unit investment trusts (e.g. SPY, DIA) don't file N-PORT and won't resolve — use IVV or VOO for S&P 500 exposure.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        ticker: { type: 'string', description: 'ETF or mutual-fund ticker (e.g. "ARKK", "SPY", "QQQ"). Fund tickers, not company stock tickers.' },
+        limit: { type: 'number', description: 'Top N holdings by weight to return (1-100, default 25)' },
+      },
+      required: ['ticker'],
+    },
+  },
+  {
     name: 'edgar_ticker_to_cik',
     description:
       'Resolve a US stock ticker (e.g. "TSLA") to the SEC\'s 10-digit CIK identifier — required by every other SEC tool. Call THIS FIRST when you have a ticker and need to use edgar_company_concept, edgar_company_filings, edgar_company_facts, sec_8k_recent, or any other SEC-keyed tool. Returns {cik, cik_padded, company_name}. Cheap, no rate limit concerns. Most other tools also accept tickers directly and call this internally — only use it explicitly when you want the CIK as data.',
@@ -834,6 +847,105 @@ async function institutionalHoldings(tickerOrCik: string, limit?: number) {
   };
 }
 
+// ── Fund / ETF holdings (Form N-PORT) ───────────────────────────────
+
+function decodeEntities(s: string | null): string | null {
+  if (s == null) return null;
+  return s
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'");
+}
+
+// ETF/mutual-fund ticker → {cik, seriesId}. The MF ticker file (~28k rows) is
+// separate from company_tickers.json; cache it in-isolate after first fetch.
+let mfTickerCache: Map<string, { cik: string; seriesId: string }> | null = null;
+async function resolveFundTicker(ticker: string): Promise<{ cik: string; seriesId: string } | null> {
+  if (!mfTickerCache) {
+    const res = await fetch('https://www.sec.gov/files/company_tickers_mf.json', { headers: SEC_HEADERS });
+    if (!res.ok) throw new Error(`SEC fund-ticker lookup error: ${res.status}`);
+    const data = (await res.json()) as { fields: string[]; data: Array<[number, string, string, string]> };
+    // fields: [cik, seriesId, classId, symbol]
+    mfTickerCache = new Map();
+    for (const [cik, seriesId, , symbol] of data.data) {
+      if (symbol && !mfTickerCache.has(symbol)) mfTickerCache.set(symbol, { cik: String(cik), seriesId });
+    }
+  }
+  return mfTickerCache.get(ticker.toUpperCase().trim()) ?? null;
+}
+
+async function fundHoldings(ticker: string, limit?: number) {
+  const t = String(ticker ?? '').trim();
+  if (!t) throw new Error('Required argument "ticker" is missing. Pass an ETF/fund ticker like "ARKK" or "SPY".');
+  const topN = Math.min(100, Math.max(1, limit ?? 25));
+
+  const resolved = await resolveFundTicker(t);
+  if (!resolved) {
+    return { ticker: t.toUpperCase(), error: 'not_found', message: `"${t}" is not a known N-PORT-filing fund/ETF ticker. Use a fund ticker like "ARKK", "QQQ", "VTI", or "VOO". (Some legacy ETFs structured as unit investment trusts — SPY, DIA — don't file N-PORT; use IVV or VOO for S&P 500.)` };
+  }
+  const { cik, seriesId } = resolved;
+  const paddedCik = padCik(cik);
+
+  const subRes = await fetch(`${DATA_BASE}/submissions/CIK${paddedCik}.json`, { headers: SEC_HEADERS });
+  if (!subRes.ok) throw new Error(`SEC submissions error: ${subRes.status}`);
+  const sub = (await subRes.json()) as {
+    cik: string; name: string;
+    filings: { recent: { accessionNumber: string[]; filingDate: string[]; form: string[] } };
+  };
+  const r = sub.filings.recent;
+  const nports: { accession: string; date: string }[] = [];
+  for (let i = 0; i < r.form.length && nports.length < 12; i++) {
+    if (r.form[i] === 'NPORT-P') nports.push({ accession: r.accessionNumber[i], date: r.filingDate[i] });
+  }
+  if (nports.length === 0) {
+    return { ticker: t.toUpperCase(), cik, error: 'no_nport', message: `No N-PORT filings found for ${sub.name}.` };
+  }
+
+  // A trust files one N-PORT per series; fetch recent candidates in parallel and
+  // match the series. Newest-first order means .find() returns the latest match.
+  const candidates = await Promise.all(
+    nports.map(async (f) => {
+      const accPath = f.accession.replace(/-/g, '');
+      const url = `https://www.sec.gov/Archives/edgar/data/${cik}/${accPath}/primary_doc.xml`;
+      try {
+        const res = await fetch(url, { headers: { 'User-Agent': SEC_HEADERS['User-Agent'] } });
+        if (!res.ok) return null;
+        return { date: f.date, accession: f.accession, xml: stripNs(await res.text()) };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const match = candidates.find((c) => c && xmlVal(c.xml, 'seriesId') === seriesId);
+  if (!match) {
+    return { ticker: t.toUpperCase(), cik, series_id: seriesId, error: 'series_not_matched', message: `Found N-PORT filings for ${sub.name} but none of the ${nports.length} most recent matched series ${seriesId}.` };
+  }
+
+  const xml = match.xml;
+  const holdings = xmlBlocks(xml, 'invstOrSec')
+    .map((h) => ({
+      name: decodeEntities(xmlVal(h, 'name')),
+      title: decodeEntities(xmlVal(h, 'title')),
+      cusip: xmlVal(h, 'cusip'),
+      balance: numOrNull(xmlVal(h, 'balance')),
+      units: xmlVal(h, 'units'),
+      value_usd: numOrNull(xmlVal(h, 'valUSD')),
+      pct_of_fund: numOrNull(xmlVal(h, 'pctVal')),
+    }))
+    .sort((a, b) => (b.pct_of_fund ?? 0) - (a.pct_of_fund ?? 0));
+
+  return {
+    ticker: t.toUpperCase(),
+    fund_name: xmlVal(xml, 'seriesName'),
+    series_id: seriesId,
+    cik,
+    report_period_end: xmlVal(xml, 'repPdDate') ?? match.date,
+    net_assets_usd: numOrNull(xmlVal(xml, 'netAssets')),
+    total_holdings: holdings.length,
+    holdings_returned: Math.min(holdings.length, topN),
+    holdings: holdings.slice(0, topN),
+  };
+}
+
 // ── callTool router ─────────────────────────────────────────────────
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -865,6 +977,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.ticker_or_cik as string,
         args.limit as number | undefined,
       );
+    case 'edgar_fund_holdings':
+      return fundHoldings(args.ticker as string, args.limit as number | undefined);
     case 'edgar_company_concept':
       return companyConcept(args.cik as string, args.concept as string);
     case 'edgar_ticker_to_cik':
