@@ -315,28 +315,32 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_documents',
     description:
-      'AUTHORITATIVE list of the SEC filing documents inside ONE specific filing, by accession number. Retrieve a filing / its contents / attachments: pass the accession (e.g. "0000320193-25-000079", with or without dashes) plus the filer\'s ticker ("AAPL") or CIK ("320193"). Returns every document in the filing folder — the primary document (10-K / 10-Q / 8-K body), all exhibits, and XBRL files — each with name, type, size, and a direct https URL, plus the filing\'s form type, filing date, and human -index.html page. Set include_primary_text:true to also pull the primary document\'s text (HTML stripped to plaintext, ~40k chars). Use to list a 10-K / 10-Q / 8-K\'s exhibits by accession number, retrieve filing contents/attachments, or fetch the text of a known filing. Get accession numbers from edgar_company_filings or edgar_search_filings. Example: edgar_filing_documents({accession: "0000320193-25-000079", ticker: "AAPL"}).',
+      'AUTHORITATIVE list of the SEC filing documents inside ONE specific filing, by accession number. Retrieve a filing / its contents / attachments: pass the accession (e.g. "0000320193-25-000079", with or without dashes) plus the filer\'s ticker ("AAPL") or CIK ("320193"). Returns every document in the filing folder — the primary document (10-K / 10-Q / 8-K body), all exhibits, and XBRL files — each with name, type, size, and a direct https URL, plus the filing\'s form type, filing date, and human -index.html page. Set include_primary_text:true to also pull the primary document\'s text (HTML stripped to plaintext, ~40k chars). Use to list a 10-K / 10-Q / 8-K\'s exhibits, retrieve filing contents/attachments, or fetch the text of a filing. You can pass an exact accession, OR just a ticker + form_type to auto-resolve the latest matching filing (no accession lookup needed). Examples: edgar_filing_documents({ticker: "NVDA", form_type: "10-K"}) for the documents in NVIDIA\'s latest annual report; edgar_filing_documents({accession: "0000320193-25-000079", ticker: "AAPL", include_primary_text: true}) for a specific filing\'s text.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         accession: {
           type: 'string',
-          description: 'SEC accession number of the filing, with or without dashes (e.g. "0000320193-25-000079" or "000032019325000079"). 18 digits shaped 10-2-6.',
+          description: 'Optional SEC accession number of a specific filing, with or without dashes (e.g. "0000320193-25-000079"). Omit it to auto-resolve the latest filing — pass form_type instead.',
         },
         ticker: {
           type: 'string',
-          description: 'The filer\'s ticker (e.g. "AAPL") or company name. Provide this OR cik — needed to build the filing archive path. Tickers are auto-resolved to CIKs.',
+          description: 'The filer\'s ticker (e.g. "AAPL", "NVDA") or company name. Provide this OR cik. Tickers are auto-resolved to CIKs.',
         },
         cik: {
           type: 'string',
           description: 'The filer\'s CIK number (e.g. "320193"). Provide this OR ticker.',
+        },
+        form_type: {
+          type: 'string',
+          description: 'When accession is omitted, the form type of the latest filing to fetch, e.g. "10-K", "10-Q", "8-K", "DEF 14A". Omit both accession and form_type to get the single most recent filing of any type.',
         },
         include_primary_text: {
           type: 'boolean',
           description: 'When true, also fetch the primary document and return its text (HTML stripped to plaintext, truncated to ~40,000 chars). Default false.',
         },
       },
-      required: ['accession'],
+      required: [],
     },
   },
 ];
@@ -525,23 +529,44 @@ function htmlToText(html: string): string {
 }
 
 async function filingDocuments(
-  accession: string,
+  accession: string | undefined,
   tickerOrCik: string,
   includePrimaryText?: boolean,
+  wantFormTypeArg?: string,
 ) {
-  const acc = normalizeAccession(accession);
-  if (!acc) {
-    throw new Error(
-      `Invalid accession "${accession}". A SEC accession number is 18 digits shaped 10-2-6 (e.g. "0000320193-25-000079" or "000032019325000079", with or without dashes). Get accession numbers from edgar_company_filings or edgar_search_filings.`,
-    );
-  }
   if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
     throw new Error(
-      'A ticker or CIK is required to build the filing archive path. Pass ticker ("AAPL") or cik ("320193"), e.g. edgar_filing_documents({accession: "' +
-        acc.dashed + '", ticker: "AAPL"}).',
+      'A ticker or CIK is required. Pass ticker ("AAPL") or cik ("320193"), plus either an accession or a form_type (e.g. edgar_filing_documents({ticker: "NVDA", form_type: "10-K"}) for the latest 10-K).',
     );
   }
   const cik = await resolveCik(tickerOrCik);
+  // Accession is optional: when omitted, resolve the latest filing matching
+  // form_type (or the single most recent filing of any type) so one-shot
+  // questions like "documents in NVIDIA's latest 10-K" work without the caller
+  // first having to look up an accession number.
+  let acc = accession ? normalizeAccession(accession) : null;
+  if (accession && !acc) {
+    throw new Error(
+      `Invalid accession "${accession}". A SEC accession number is 18 digits shaped 10-2-6 (e.g. "0000320193-25-000079", with or without dashes). Get accession numbers from edgar_company_filings, or omit accession and pass form_type to auto-resolve the latest.`,
+    );
+  }
+  if (!acc) {
+    const wantForm = wantFormTypeArg?.trim().toUpperCase();
+    const subRes = await fetch(`${DATA_BASE}/submissions/CIK${padCik(cik)}.json`, { headers: SEC_HEADERS });
+    if (!subRes.ok) throw new Error(`SEC submissions lookup failed (HTTP ${subRes.status}) resolving the latest filing for ${tickerOrCik}.`);
+    const sub = (await subRes.json()) as { filings?: { recent?: { accessionNumber?: string[]; form?: string[] } } };
+    const r = sub.filings?.recent;
+    const forms = r?.form ?? [];
+    const accs = r?.accessionNumber ?? [];
+    const idx = wantForm ? forms.findIndex((f) => f.toUpperCase() === wantForm) : 0;
+    if (idx < 0 || !accs[idx]) {
+      throw new Error(
+        `No ${wantForm ?? 'recent'} filing found for ${tickerOrCik} in the recent index. Use edgar_company_filings({ticker:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list available filings, then pass an accession.`,
+      );
+    }
+    acc = normalizeAccession(accs[idx]);
+    if (!acc) throw new Error('Failed to resolve a valid accession from the submissions index.');
+  }
   const cikNoZeros = String(Number(cik.replace(/\D/g, ''))); // archive path uses CIK with no leading zeros
   const paddedCik = padCik(cik);
 
@@ -1360,9 +1385,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return companyConcept((args.cik ?? args.ticker_or_cik) as string, args.concept as string);
     case 'edgar_filing_documents':
       return filingDocuments(
-        args.accession as string,
+        args.accession as string | undefined,
         (args.cik ?? args.ticker ?? args.ticker_or_cik) as string,
         args.include_primary_text as boolean | undefined,
+        args.form_type as string | undefined,
       );
     case 'edgar_ticker_to_cik':
       return tickerToCik(args.ticker as string);
