@@ -52,16 +52,6 @@ For insider trades specifically, see the dedicated `insider-trading` pack — it
 - **Real-time-ish, not real-time.** Filings appear on EDGAR within minutes of submission, but Pipeworx caches results. For breaking-news-grade timeliness, set `Cache-Control: no-cache` (anonymous limit applies) or check the `_meta.cache.fresh_until` field.
 - **Concept availability differs.** Smaller filers tag fewer XBRL concepts than large ones. `edgar_company_concept` may return empty arrays for valid concepts that the company simply doesn't report. Use `edgar_company_facts` to see which concepts a company DOES report.
 
-## No MCP client? Call it over HTTP
-
-```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/edgar_search_filings \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"artificial intelligence","form_type":"10-K","start_date":"2024-01-01","end_date":"2024-12-31","limit":20}'
-```
-
-No account needed for the first calls. Inspect any tool — schema, examples, cost — with `GET https://gateway.pipeworx.io/v1/tools/edgar_search_filings`. Find one with `POST https://gateway.pipeworx.io/v1/tools/search_packs` and `{"query":"..."}`. Errors come back as JSON with a `retry_hint`.
-
 ## Quick Start
 
 Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
