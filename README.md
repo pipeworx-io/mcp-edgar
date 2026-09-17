@@ -119,3 +119,13 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/edgar_search_filings \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"artificial intelligence","form_type":"10-K","start_date":"2024-01-01","end_date":"2024-12-31","limit":20}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/edgar_search_filings`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
