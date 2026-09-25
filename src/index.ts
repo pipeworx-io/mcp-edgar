@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -1551,7 +1586,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_text',
     description:
-      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, and the liquidity footnote. Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events). Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page and can make a late `section` (e.g. subsequent_events) come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
+      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
     summary: 'The full text of an SEC filing\'s main document, HTML stripped to clean plaintext.',
     inputSchema: {
       type: 'object' as const,
@@ -1570,7 +1605,7 @@ const tools: McpToolExport['tools'] = [
         },
         form_type: {
           type: 'string',
-          description: 'When accession is omitted, the form type of the latest filing to fetch — "10-K", "10-Q", "8-K", "DEF 14A", etc.',
+          description: 'When accession is omitted, the form type of the latest filing to fetch — "10-K", "10-Q", "8-K", "DEF 14A", etc. A question asking for the "most recent 10-K OR 10-Q" (or otherwise not committed to one type) should OMIT this field entirely rather than guess "10-K" by habit — omitting form_type (along with accession) returns the single most recent filing of ANY type, and a 10-Q is very often more recent than the last 10-K since it files quarterly while the 10-K only files once a year (verified live 2026-09-25, fleet #2450: NTRA\'s most recent 10-Q was filed 2026-08-07, five months after its 2026-02-27 10-K — passing form_type:"10-K" here silently skips the newer filing and the KPI it asked about).',
         },
         section: {
           type: 'string',
@@ -1584,6 +1619,22 @@ const tools: McpToolExport['tools'] = [
         offset: {
           type: 'number',
           description: 'Character offset to start from (default 0). Pass the prior result\'s next_offset to page forward.',
+        },
+        search: {
+          type: 'string',
+          description: 'Find a specific fact instead of paging blind. This is a SUBSTRING match, not a relevance search — pass the exact 2-4 word phrase most likely to appear VERBATIM in the prose ("tests processed", "processed approximately", "going concern"), never a compound of every concept in the question. A phrase that ANDs several unrelated question-words together ("oncology Signatera revenue test volume") returns ZERO matches even in the CORRECT filing, because the filing\'s own sentence never contains all of those words together — verified live 2026-09-25 (fleet #2450) on a real Natera 10-Q that DOES report the exact number asked for: "Signatera revenue" and the 4-word compound above both found nothing, while the filing\'s own wording ("processed approximately", "tests processed") is what actually appears. When unsure of the filing\'s exact phrasing, prefer the SHORTEST distinctive 2-3 word fragment of the metric name itself (a unit, a verb+noun like "processed approximately") over restating the question. Case-insensitive substring match over the WHOLE document text (or the whole `section` slice, if both are given), run BEFORE max_chars/offset windowing. Returns every matching passage (surrounding context + its own offset in the document) instead of the normal paged `text` — use the returned offsets with a follow-up call (no `search`, `offset` set to one of them) if you need more surrounding text than the passage gives. Zero matches means try again with a SHORTER, more literal phrase before concluding the filing does not disclose it — this is a real answer about wording, not a tool failure. Accepted aliases: `contains`, `find`, `phrase`.',
+        },
+        contains: {
+          type: 'string',
+          description: 'Alias for `search`.',
+        },
+        find: {
+          type: 'string',
+          description: 'Alias for `search`.',
+        },
+        phrase: {
+          type: 'string',
+          description: 'Alias for `search`.',
         },
         ticker_or_cik: {
           type: 'string',
@@ -2464,6 +2515,72 @@ const FILING_SECTION_PATTERNS: Record<string, { anchor: RegExp; pick: 'first' | 
 const FILING_TEXT_DEFAULT_MAX = 50000;
 const FILING_TEXT_CAP = 100000;
 
+// fleet #2446: a KPI question ("how many tests did $TICKER process") routed
+// correctly to edgar_filing_text but the fact sat ~100k characters into a
+// 10-Q's MD&A, which meant paging max_chars windows by hand to find it. This
+// is a plain case-insensitive substring scan of the ALREADY-EXTRACTED plain-
+// text document (not a second fetch) — cheap, and it runs before the normal
+// offset/max_chars windowing so it sees the whole doc (or the whole `section`
+// slice) rather than one page of it.
+const SEARCH_CONTEXT_CHARS = 400;
+const SEARCH_MAX_PASSAGES = 10;
+
+// A KPI figure looks like "2,056,800" or "1,708,200" — thousands-grouped, or
+// otherwise a bare run of 4+ digits (a raw count with no separator).
+const NEARBY_NUMBER_RE = /\d{1,3}(?:,\d{3})+|\d{4,}/;
+
+function findPassages(
+  text: string,
+  term: string,
+  contextChars = SEARCH_CONTEXT_CHARS,
+  maxPassages = SEARCH_MAX_PASSAGES,
+): { total: number; distinct_locations: number; passages: Array<{ offset: number; text: string }> } {
+  const needle = term.toLowerCase();
+  if (!needle) return { total: 0, distinct_locations: 0, passages: [] };
+  const hay = text.toLowerCase();
+  const offsets: number[] = [];
+  let from = 0;
+  for (;;) {
+    const idx = hay.indexOf(needle, from);
+    if (idx === -1) break;
+    offsets.push(idx);
+    from = idx + needle.length;
+  }
+
+  // Merge occurrences close enough that their context windows would overlap
+  // into ONE passage — a KPI sentence ("we processed approximately X tests,
+  // compared to Y tests processed") can repeat the search term 2-3 times a
+  // few words apart, and without this a common word burns most of the
+  // (capped) passage budget on one sentence instead of covering the document.
+  const groups: Array<{ first: number; last: number }> = [];
+  for (const idx of offsets) {
+    const g = groups[groups.length - 1];
+    if (g && idx - g.last <= contextChars * 2) g.last = idx;
+    else groups.push({ first: idx, last: idx });
+  }
+
+  // Rank groups whose window carries a nearby NUMBER first. A KPI question
+  // ("how many tests/units/subscribers") is answered by a figure next to the
+  // word, not by every mention of the word — measured live (fleet #2446):
+  // searching "tests" in Natera's Q2 2026 10-Q hits 78 times, mostly
+  // forward-looking-statements boilerplate ("expectations... for our
+  // tests"), with the actual "processed approximately 2,056,800 tests" KPI
+  // buried past the first ~80 of them by document order. Ranking by nearby
+  // digits (no second fetch — same text already in hand) reliably surfaces
+  // it inside a small `maxPassages` cap instead of requiring the caller to
+  // already know the more distinctive phrase to search for. Groups without a
+  // nearby number keep DOCUMENT ORDER among themselves (stable sort).
+  const scored = groups.map((g) => {
+    const start = Math.max(0, g.first - contextChars);
+    const end = Math.min(text.length, g.last + needle.length + contextChars);
+    return { start, end, hasNumber: NEARBY_NUMBER_RE.test(text.slice(start, end)) ? 1 : 0 };
+  });
+  scored.sort((a, b) => b.hasNumber - a.hasNumber);
+
+  const passages = scored.slice(0, maxPassages).map((s) => ({ offset: s.start, text: text.slice(s.start, s.end) }));
+  return { total: offsets.length, distinct_locations: groups.length, passages };
+}
+
 // Fetch ONE filing's primary-document text, HTML-stripped, paged. Splitting this
 // out (rather than piggybacking edgar_filing_documents' include_primary_text,
 // which caps at 40k and can't page) lets the register pull deep disclosures —
@@ -2475,6 +2592,7 @@ async function filingText(
   maxChars?: number,
   offset?: number,
   wantFormTypeArg?: string,
+  searchTerm?: string,
 ) {
   if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
     throw new Error('A company is required: pass `ticker` ("ACTU"), `cik` or their alias `ticker_or_cik` — plus either an accession or a form_type (e.g. edgar_filing_text({ticker:"ACTU", form_type:"10-Q"})).');
@@ -2557,6 +2675,44 @@ async function filingText(
         sectionFound = false;
       }
     }
+  }
+
+  // `search` short-circuits the normal offset/max_chars windowing: it scans
+  // the whole (possibly section-sliced) document and returns matching
+  // passages with their own offsets, rather than one page of raw text the
+  // caller has to eyeball for the fact they wanted (fleet #2446).
+  const search = (searchTerm ?? '').trim();
+  if (search) {
+    const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, search);
+    return {
+      accession: acc.dashed,
+      cik: cikNoZeros,
+      company: sub.name ?? null,
+      form: formType,
+      filed: filingDate,
+      document: primaryDocument,
+      document_url: docUrl,
+      section: sectionApplied,
+      ...(sectionFound !== null ? { section_found: sectionFound } : {}),
+      total_chars: fullText.length,
+      search: {
+        term: search,
+        total_matches: totalMatches,
+        distinct_locations: distinctLocations,
+        returned: passages.length,
+        truncated: distinctLocations > passages.length,
+        passages,
+        note: totalMatches === 0
+          ? 'No case-insensitive match for this exact wording in the document (or section, if one was given). That is a real answer, not a failure — retry with a shorter phrase or drop `section` to search the whole document.'
+          : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
+      },
+      ...(rawTruncated
+        ? {
+            raw_truncated: true,
+            raw_truncated_note: `This document's raw HTML exceeds the ${(FILING_DOC_MAX_BYTES / 1_000_000).toFixed(0)}MB this tool reads in one call, so the search above only scanned the portion read — NOT the whole filing. Treat total_matches:0 as inconclusive, not "absent", for a raw_truncated document.`,
+          }
+        : {}),
+    };
   }
 
   const total = fullText.length;
@@ -4439,6 +4595,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.max_chars as number | undefined,
         args.offset as number | undefined,
         args.form_type as string | undefined,
+        (args.search ?? args.contains ?? args.find ?? args.phrase) as string | undefined,
       );
     case 'edgar_ticker_to_cik':
       return tickerToCik((args.ticker ?? args.ticker_or_cik ?? args.company) as string);

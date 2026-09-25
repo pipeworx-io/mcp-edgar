@@ -9,7 +9,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import pack from './index.js';
 
 const server = new Server(
-  { name: '@pipeworx/mcp-edgar', version: '0.3.3' },
+  { name: '@pipeworx/mcp-edgar', version: '0.3.4' },
   { capabilities: { tools: {} } },
 );
 
