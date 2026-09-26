@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-edgar",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "EDGAR MCP — SEC EDGAR public APIs (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-8ebd704e53458e829aea1033aa14ef78911a50cd60211956318c1574f8b1eb4c",
-    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
+    "sourceHash": "v1-11e345a6ca7725b75cd7b396ad673e52735a250951201acc76dbfd62907be72f",
+    "sourceCommit": "6182c4cfebddb94950e060b5d2fca18f18ad1aca"
   }
 }

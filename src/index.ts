@@ -1622,7 +1622,7 @@ const tools: McpToolExport['tools'] = [
         },
         search: {
           type: 'string',
-          description: 'Find a specific fact instead of paging blind. This is a SUBSTRING match, not a relevance search — pass the exact 2-4 word phrase most likely to appear VERBATIM in the prose ("tests processed", "processed approximately", "going concern"), never a compound of every concept in the question. A phrase that ANDs several unrelated question-words together ("oncology Signatera revenue test volume") returns ZERO matches even in the CORRECT filing, because the filing\'s own sentence never contains all of those words together — verified live 2026-09-25 (fleet #2450) on a real Natera 10-Q that DOES report the exact number asked for: "Signatera revenue" and the 4-word compound above both found nothing, while the filing\'s own wording ("processed approximately", "tests processed") is what actually appears. When unsure of the filing\'s exact phrasing, prefer the SHORTEST distinctive 2-3 word fragment of the metric name itself (a unit, a verb+noun like "processed approximately") over restating the question. Case-insensitive substring match over the WHOLE document text (or the whole `section` slice, if both are given), run BEFORE max_chars/offset windowing. Returns every matching passage (surrounding context + its own offset in the document) instead of the normal paged `text` — use the returned offsets with a follow-up call (no `search`, `offset` set to one of them) if you need more surrounding text than the passage gives. Zero matches means try again with a SHORTER, more literal phrase before concluding the filing does not disclose it — this is a real answer about wording, not a tool failure. Accepted aliases: `contains`, `find`, `phrase`.',
+          description: 'Find a specific fact instead of paging blind. Pass a short 2-4 word phrase likely to appear VERBATIM in the prose ("processed approximately", "tests processed", "going concern") rather than restating the question. Case-insensitive substring match over the WHOLE document text (or the whole `section` slice), run BEFORE max_chars/offset windowing; returns matching passages (context + their own offset) instead of the paged `text`, ranking passages with a nearby figure first. If a multi-word phrase has no verbatim match, it falls back to the phrase\'s individual words and returns the passages holding the most of them (search.match_mode "words") — read those passages for the fact rather than treating them as confirmed. Use a returned offset with a follow-up call (no `search`) to read more surrounding text. Accepted aliases: `contains`, `find`, `phrase`.',
         },
         contains: {
           type: 'string',
@@ -2609,6 +2609,74 @@ function findPassages(
   return { total: offsets.length, distinct_locations: groups.length, passages };
 }
 
+// fleet #2450: the router answers in ONE tool call, so "retry with a shorter
+// phrase" (the old zero-match note) never happens inside ask_pipeworx. Measured
+// live 2026-09-26: 5 of 5 routed calls for the Natera "revenue and test volume
+// in its most recent 10-K or 10-Q" question reached the RIGHT filing and passed
+// a compound phrase ("Signatera revenue", "oncology Signatera revenue test
+// volume") that matches nothing verbatim — while the word "Signatera" alone
+// lands on the "processed approximately 2,056,800 tests" sentence. A description
+// telling the router to pass shorter phrases did not change what it passed.
+// So when the exact phrase misses, fall back to the phrase's WORDS: anchor on
+// the rarer words, rank each window by how many distinct query words it holds
+// (then by a nearby figure), and say plainly that this is a word-level match.
+const WORD_FALLBACK_STOP = new Set([
+  'the', 'and', 'for', 'its', 'our', 'their', 'with', 'from', 'that', 'this', 'what', 'which',
+  'most', 'recent', 'latest', 'report', 'reported', 'reports', 'filing', 'total', 'any', 'all',
+]);
+const WORD_FALLBACK_ANCHOR_MAX = 60;
+
+export function findWordPassages(
+  text: string,
+  phrase: string,
+  contextChars = SEARCH_CONTEXT_CHARS,
+  maxPassages = SEARCH_MAX_PASSAGES,
+): { words: Array<{ word: string; occurrences: number }>; distinct_locations: number; passages: Array<{ offset: number; text: string; words_matched: string[] }> } | null {
+  const words = [...new Set(phrase.toLowerCase().split(/[^a-z0-9&-]+/).filter((w) => w.length >= 3 && !WORD_FALLBACK_STOP.has(w)))];
+  if (words.length < 2) return null;
+  const hay = text.toLowerCase();
+  const occ = new Map<string, number[]>();
+  for (const w of words) {
+    const offs: number[] = [];
+    let from = 0;
+    for (;;) {
+      const i = hay.indexOf(w, from);
+      if (i === -1) break;
+      offs.push(i);
+      from = i + w.length;
+    }
+    occ.set(w, offs);
+  }
+  const present = words.filter((w) => (occ.get(w) ?? []).length > 0);
+  if (present.length === 0) return null;
+  // Anchor on every word rare enough to be distinctive; if every word is
+  // common, anchor on the rarest one only (bounded work on a 200k-char doc).
+  const byRarity = [...present].sort((a, b) => occ.get(a)!.length - occ.get(b)!.length);
+  const anchors = byRarity.filter((w) => occ.get(w)!.length <= WORD_FALLBACK_ANCHOR_MAX);
+  const anchorWords = anchors.length ? anchors : [byRarity[0]];
+  const anchorOffs = [...new Set(anchorWords.flatMap((w) => occ.get(w)!))].sort((a, b) => a - b);
+
+  const groups: Array<{ first: number; last: number }> = [];
+  for (const idx of anchorOffs) {
+    const g = groups[groups.length - 1];
+    if (g && idx - g.last <= contextChars * 2) g.last = idx;
+    else groups.push({ first: idx, last: idx });
+  }
+  const scored = groups.map((g) => {
+    const start = Math.max(0, g.first - contextChars);
+    const end = Math.min(text.length, g.last + contextChars);
+    const win = hay.slice(start, end);
+    const matched = present.filter((w) => win.includes(w));
+    return { start, end, matched, hasNumber: NEARBY_NUMBER_RE.test(text.slice(start, end)) ? 1 : 0 };
+  });
+  scored.sort((a, b) => (b.matched.length - a.matched.length) || (b.hasNumber - a.hasNumber));
+  return {
+    words: words.map((w) => ({ word: w, occurrences: (occ.get(w) ?? []).length })),
+    distinct_locations: groups.length,
+    passages: scored.slice(0, maxPassages).map((s) => ({ offset: s.start, text: text.slice(s.start, s.end), words_matched: s.matched })),
+  };
+}
+
 // Fetch ONE filing's primary-document text, HTML-stripped, paged. Splitting this
 // out (rather than piggybacking edgar_filing_documents' include_primary_text,
 // which caps at 40k and can't page) lets the register pull deep disclosures —
@@ -2712,6 +2780,7 @@ async function filingText(
   const search = (searchTerm ?? '').trim();
   if (search) {
     const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, search);
+    const wordHit = totalMatches === 0 ? findWordPassages(fullText, search) : null;
     return {
       accession: acc.dashed,
       cik: cikNoZeros,
@@ -2723,17 +2792,30 @@ async function filingText(
       section: sectionApplied,
       ...(sectionFound !== null ? { section_found: sectionFound } : {}),
       total_chars: fullText.length,
-      search: {
-        term: search,
-        total_matches: totalMatches,
-        distinct_locations: distinctLocations,
-        returned: passages.length,
-        truncated: distinctLocations > passages.length,
-        passages,
-        note: totalMatches === 0
-          ? 'No case-insensitive match for this exact wording in the document (or section, if one was given). That is a real answer, not a failure — retry with a shorter phrase or drop `section` to search the whole document.'
-          : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
-      },
+      search: wordHit
+        ? {
+          term: search,
+          match_mode: 'words',
+          exact_matches: 0,
+          words: wordHit.words,
+          distinct_locations: wordHit.distinct_locations,
+          returned: wordHit.passages.length,
+          truncated: wordHit.distinct_locations > wordHit.passages.length,
+          passages: wordHit.passages,
+          note: `The exact phrase "${search}" does not appear in this document, so these are passages holding its individual WORDS, ranked by how many of them each passage contains (then by a nearby figure). Read each passage for the fact asked — a word-level match is a lead, not a confirmation. Each offset can be passed as \`offset\` (without \`search\`) to read more surrounding text.`,
+        }
+        : {
+          term: search,
+          match_mode: 'exact',
+          total_matches: totalMatches,
+          distinct_locations: distinctLocations,
+          returned: passages.length,
+          truncated: distinctLocations > passages.length,
+          passages,
+          note: totalMatches === 0
+            ? 'No case-insensitive match for this wording (nor, for a multi-word phrase, for any of its individual words) in the document (or section, if one was given). That is a real answer, not a failure — retry with different wording or drop `section` to search the whole document.'
+            : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
+        },
       ...(rawTruncated
         ? {
             raw_truncated: true,
