@@ -1569,7 +1569,7 @@ const tools: McpToolExport['tools'] = [
         },
         form_type: {
           type: 'string',
-          description: 'When accession is omitted, the form type of the latest filing to fetch, e.g. "10-K", "10-Q", "8-K", "DEF 14A". Omit both accession and form_type to get the single most recent filing of any type.',
+          description: 'When accession is omitted, the form type of the latest filing to fetch, e.g. "10-K", "10-Q", "8-K", "DEF 14A" — or a `|`-separated SET ("10-K|10-Q") for "the most recent of either, whichever is newer". Omit both accession and form_type to get the single most recent filing of ANY type at all (routine 8-Ks/Form 4s/Form 144s included, not just annual/quarterly reports) — use the `|` set instead when you specifically want the newest 10-K or 10-Q.',
         },
         include_primary_text: {
           type: 'boolean',
@@ -1605,7 +1605,7 @@ const tools: McpToolExport['tools'] = [
         },
         form_type: {
           type: 'string',
-          description: 'When accession is omitted, the form type of the latest filing to fetch — "10-K", "10-Q", "8-K", "DEF 14A", etc. A question asking for the "most recent 10-K OR 10-Q" (or otherwise not committed to one type) should OMIT this field entirely rather than guess "10-K" by habit — omitting form_type (along with accession) returns the single most recent filing of ANY type, and a 10-Q is very often more recent than the last 10-K since it files quarterly while the 10-K only files once a year (verified live 2026-09-25, fleet #2450: NTRA\'s most recent 10-Q was filed 2026-08-07, five months after its 2026-02-27 10-K — passing form_type:"10-K" here silently skips the newer filing and the KPI it asked about).',
+          description: 'When accession is omitted, the form type of the latest filing to fetch — "10-K", "10-Q", "8-K", "DEF 14A", etc. For "the most recent 10-K OR 10-Q" (or any "whichever of these is newer" question), pass a `|`-separated SET, e.g. "10-K|10-Q" — do NOT guess a single type ("10-K" by habit skips a newer 10-Q) and do NOT omit this field to get "any type", since a company files far more 8-Ks/Form 4s/Form 144s between annual or quarterly reports than it files the reports themselves and an empty form_type returns the single most recent filing of ANY kind (verified live 2026-09-25, fleet #2450: NTRA\'s single most recent SEC filing was a Form 144 insider-sale notice, filed weeks after its real 10-Q and completely unrelated to the question asked).',
         },
         section: {
           type: 'string',
@@ -2368,6 +2368,34 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+/**
+ * Index into SEC's own recent-first `forms` array of the latest filing
+ * matching `wantFormTypeArg` — a single form ("10-Q") or a `|`-separated SET
+ * ("10-K|10-Q" for "the most recent annual or quarterly report, whichever is
+ * newer"), same pipe convention this catalog already uses for status fields
+ * (grants-gov's "posted|forecasted"). Omitted/empty returns 0 — the single
+ * most recent filing of ANY type.
+ *
+ * Fleet #2450: a question asking for "the most recent 10-K or 10-Q" cannot
+ * be answered by omitting form_type — that resolves to the single most
+ * recent filing of ANY type, and a company files far more 8-Ks, Form 4s and
+ * Form 144s between annual/quarterly reports than it files the reports
+ * themselves. Verified live: NTRA's single most recent SEC filing on
+ * 2026-09-23 was a Form 144 insider-sale notice, not an annual or quarterly
+ * report at all — form_type left empty silently returns THAT instead of the
+ * 10-Q the question meant. Nor does picking one type and hoping work: a
+ * 10-Q is very often newer than the last 10-K. "10-K|10-Q" is the answer to
+ * "I don't care which, just the newest of these".
+ */
+function findLatestFormIndex(forms: string[], wantFormTypeArg: string | undefined): number {
+  const wanted = (wantFormTypeArg ?? '')
+    .split('|')
+    .map((f) => f.trim().toUpperCase())
+    .filter(Boolean);
+  if (!wanted.length) return 0;
+  return forms.findIndex((f) => wanted.includes(f.toUpperCase()));
+}
+
 async function filingDocuments(
   accession: string | undefined,
   tickerOrCik: string,
@@ -2398,7 +2426,7 @@ async function filingDocuments(
     const r = sub.filings?.recent;
     const forms = r?.form ?? [];
     const accs = r?.accessionNumber ?? [];
-    const idx = wantForm ? forms.findIndex((f) => f.toUpperCase() === wantForm) : 0;
+    const idx = findLatestFormIndex(forms, wantFormTypeArg);
     if (idx < 0 || !accs[idx]) {
       throw new Error(
         `No ${wantForm ?? 'recent'} filing found for ${tickerOrCik} in the recent index. Use edgar_company_filings({ticker:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list available filings, then pass an accession.`,
@@ -2619,7 +2647,7 @@ async function filingText(
 
   if (!acc) {
     const wantForm = wantFormTypeArg?.trim().toUpperCase();
-    const idx = wantForm ? forms.findIndex((f) => f.toUpperCase() === wantForm) : 0;
+    const idx = findLatestFormIndex(forms, wantFormTypeArg);
     if (idx < 0 || !accs[idx]) {
       throw new Error(`No ${wantForm ?? 'recent'} filing found for ${tickerOrCik}. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list filings, then pass an accession.`);
     }
