@@ -1586,7 +1586,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_text',
     description:
-      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
+      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. **For a question asking two facts from the same filing** ("revenue and test volume in the latest 10-Q"), pass `search` as `|`-separated phrases (e.g. "revenue|tests processed") to get both in this one call under `searches[]` — and when a phrase names a financial total (revenue, net income, EPS, ...), the matching XBRL figure for this exact accession comes back under `xbrl` even if that total never appears as an absolute number in the prose (common: filings often state only the growth delta/percentage in text). Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
     summary: 'The full text of an SEC filing\'s main document, HTML stripped to clean plaintext.',
     inputSchema: {
       type: 'object' as const,
@@ -1622,7 +1622,7 @@ const tools: McpToolExport['tools'] = [
         },
         search: {
           type: 'string',
-          description: 'Find a specific fact instead of paging blind. Pass a short 2-4 word phrase likely to appear VERBATIM in the prose ("processed approximately", "tests processed", "going concern") rather than restating the question. Case-insensitive substring match over the WHOLE document text (or the whole `section` slice), run BEFORE max_chars/offset windowing; returns matching passages (context + their own offset) instead of the paged `text`, ranking passages with a nearby figure first. If a multi-word phrase has no verbatim match, it falls back to the phrase\'s individual words and returns the passages holding the most of them (search.match_mode "words") — read those passages for the fact rather than treating them as confirmed. Use a returned offset with a follow-up call (no `search`) to read more surrounding text. Accepted aliases: `contains`, `find`, `phrase`.',
+          description: 'Find a specific fact instead of paging blind. Pass a short 2-4 word phrase likely to appear VERBATIM in the prose ("processed approximately", "tests processed", "going concern") rather than restating the question. Case-insensitive substring match over the WHOLE document text (or the whole `section` slice), run BEFORE max_chars/offset windowing; returns matching passages (context + their own offset) instead of the paged `text`, ranking passages with a nearby figure first. If a multi-word phrase has no verbatim match, it falls back to the phrase\'s individual words and returns the passages holding the most of them (search.match_mode "words") — read those passages for the fact rather than treating them as confirmed. Use a returned offset with a follow-up call (no `search`) to read more surrounding text. **For TWO OR MORE facts from this same filing in one call, separate phrases with `|`** (e.g. "Signatera revenue|tests processed") — each is searched independently and reported under `searches[]`, keyed by `phrase`, instead of the singular `search`. This is the way to answer a compound question ("what was revenue AND test volume in the latest 10-Q") without a second call. Note: a phrase naming a financial TOTAL (revenue, net income, EPS, assets, cash, gross/operating profit, long-term debt, stockholders equity, shares outstanding) often has NO verbatim match at all, because filers frequently state only the growth delta/percentage in prose and report the actual total exclusively in XBRL — when a phrase names one of these, the response also attaches that concept\'s value for THIS SAME accession under `xbrl` (sourced like edgar_company_concept, not text-matched), so you don\'t need a separate edgar_company_concept call just to get the number the text search alone would report as a false "not found". Accepted aliases: `contains`, `find`, `phrase`.',
         },
         contains: {
           type: 'string',
@@ -2777,10 +2777,61 @@ async function filingText(
   // the whole (possibly section-sliced) document and returns matching
   // passages with their own offsets, rather than one page of raw text the
   // caller has to eyeball for the fact they wanted (fleet #2446).
-  const search = (searchTerm ?? '').trim();
-  if (search) {
-    const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, search);
-    const wordHit = totalMatches === 0 ? findWordPassages(fullText, search) : null;
+  //
+  // fleet #2450: a question can ask for TWO facts from the SAME filing
+  // ("revenue AND test volume") and ask_pipeworx's router picks ONE tool call
+  // for a single-entity question — so a single `search` phrase per call meant
+  // the second fact was structurally unreachable. `search` now accepts
+  // multiple phrases separated by `|` (same convention as `form_type`'s
+  // "10-K|10-Q" set) and reports each phrase's passages independently under
+  // `searches`, keyed by `phrase`. A single phrase (no `|`) keeps the original
+  // singular `search` shape unchanged.
+  const searchPhrases = [...new Set(
+    (searchTerm ?? '').split('|').map((p) => p.trim()).filter(Boolean),
+  )].slice(0, 5);
+  if (searchPhrases.length > 0) {
+    const buildOne = async (term: string) => {
+      const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, term);
+      const wordHit = totalMatches === 0 ? findWordPassages(fullText, term) : null;
+      // A phrase naming a financial concept (revenue, net income, EPS, ...)
+      // is frequently XBRL-only — never printed as an absolute figure in the
+      // prose at all (verified live: Natera's 10-Q states revenue only as a
+      // dollar/percent DELTA, never the total) — so attach the filer's own
+      // XBRL fact for THIS accession when the phrase names one, regardless of
+      // whether the text search above found anything.
+      const financialConcept = detectFinancialConcept(term);
+      const xbrl = financialConcept
+        ? await financialFactForFiling(tickerOrCik, financialConcept, formType, filingDate)
+        : null;
+      const base = wordHit
+        ? {
+          term,
+          match_mode: 'words' as const,
+          exact_matches: 0,
+          words: wordHit.words,
+          distinct_locations: wordHit.distinct_locations,
+          returned: wordHit.passages.length,
+          truncated: wordHit.distinct_locations > wordHit.passages.length,
+          passages: wordHit.passages,
+          note: `The exact phrase "${term}" does not appear in this document, so these are passages holding its individual WORDS, ranked by how many of them each passage contains (then by a nearby figure). Read each passage for the fact asked — a word-level match is a lead, not a confirmation. Each offset can be passed as \`offset\` (without \`search\`) to read more surrounding text.`,
+        }
+        : {
+          term,
+          match_mode: 'exact' as const,
+          total_matches: totalMatches,
+          distinct_locations: distinctLocations,
+          returned: passages.length,
+          truncated: distinctLocations > passages.length,
+          passages,
+          note: totalMatches === 0
+            ? 'No case-insensitive match for this wording (nor, for a multi-word phrase, for any of its individual words) in the document (or section, if one was given). That is a real answer, not a failure — retry with different wording or drop `section` to search the whole document.'
+            : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
+        };
+      return xbrl ? { ...base, xbrl } : base;
+    };
+
+    const results = await Promise.all(searchPhrases.map(buildOne));
+
     return {
       accession: acc.dashed,
       cik: cikNoZeros,
@@ -2792,30 +2843,12 @@ async function filingText(
       section: sectionApplied,
       ...(sectionFound !== null ? { section_found: sectionFound } : {}),
       total_chars: fullText.length,
-      search: wordHit
-        ? {
-          term: search,
-          match_mode: 'words',
-          exact_matches: 0,
-          words: wordHit.words,
-          distinct_locations: wordHit.distinct_locations,
-          returned: wordHit.passages.length,
-          truncated: wordHit.distinct_locations > wordHit.passages.length,
-          passages: wordHit.passages,
-          note: `The exact phrase "${search}" does not appear in this document, so these are passages holding its individual WORDS, ranked by how many of them each passage contains (then by a nearby figure). Read each passage for the fact asked — a word-level match is a lead, not a confirmation. Each offset can be passed as \`offset\` (without \`search\`) to read more surrounding text.`,
-        }
+      ...(searchPhrases.length === 1
+        ? { search: results[0] }
         : {
-          term: search,
-          match_mode: 'exact',
-          total_matches: totalMatches,
-          distinct_locations: distinctLocations,
-          returned: passages.length,
-          truncated: distinctLocations > passages.length,
-          passages,
-          note: totalMatches === 0
-            ? 'No case-insensitive match for this wording (nor, for a multi-word phrase, for any of its individual words) in the document (or section, if one was given). That is a real answer, not a failure — retry with different wording or drop `section` to search the whole document.'
-            : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
-        },
+            searches: searchPhrases.map((phrase, i) => ({ phrase, ...results[i] })),
+            searches_note: 'Multiple `|`-separated phrases were requested — each is searched independently against the SAME document/section and reported under its own entry, keyed by `phrase`. Read each entry for its own fact rather than assuming they describe the same period (e.g. a quarterly revenue total and a six-month cumulative KPI can both be real and still not comparable).',
+          }),
       ...(rawTruncated
         ? {
             raw_truncated: true,
@@ -3568,6 +3601,80 @@ async function companyConcept(
     values: rows,
     annual_values: rows, // deprecated alias; prefer `values` (now period-scoped)
   };
+}
+
+// fleet #2450: a ClearGene-style question ("Signatera revenue AND test volume
+// from Natera's latest 10-Q") never got both facts, because a financial TOTAL
+// like revenue is frequently XBRL-only and never printed as an absolute
+// dollar figure anywhere in the filing's prose — verified live 2026-09-29:
+// Natera's Q2 2026 10-Q text discusses revenue only as percentage/dollar
+// DELTAS ("increased by $206.2 million, or 37.7%"), never the $752.75M total
+// itself, so no `search` phrasing, exact or word-fallback, can ever surface
+// it from the text. edgar_filing_text's `search` now recognizes when a
+// requested phrase NAMES a financial concept this filer tags in XBRL (the
+// same friendly-name table edgar_company_concept resolves) and attaches that
+// concept's value for THIS SAME accession/period alongside the text
+// passages — one tool call gets the KPI from prose and the total from XBRL.
+// Matching is by N-GRAM of the phrase's tokens (not a raw substring) so a
+// short ambiguous key ("cash", "eps") only fires on a real standalone token,
+// not embedded inside an unrelated word.
+function detectFinancialConcept(phrase: string): string | null {
+  const tokens = phrase.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  for (let n = Math.min(3, tokens.length); n >= 1; n--) {
+    for (let i = 0; i + n <= tokens.length; i++) {
+      const gram = tokens.slice(i, i + n).join('');
+      if (CONCEPT_CANDIDATES[gram]) return gram;
+    }
+  }
+  return null;
+}
+
+// Best-effort: find the XBRL fact for `friendlyConcept` that belongs to the
+// EXACT filing edgar_filing_text is already reading (same form + same filed
+// date), not just "the latest" — a different period would silently pair the
+// wrong quarter's total with this filing's prose. Never throws: an XBRL miss
+// (concept not reported, SEC rate-limited, etc.) just means no `xbrl`
+// companion is attached, and the text passages above stand on their own.
+async function financialFactForFiling(
+  tickerOrCik: string,
+  friendlyConcept: string,
+  wantForm: string | null,
+  wantFiled: string | null,
+): Promise<Record<string, unknown> | null> {
+  if (!wantForm || !wantFiled) return null;
+  try {
+    const cc = (await companyConcept(tickerOrCik, friendlyConcept)) as {
+      concept?: string;
+      label?: string;
+      requested_concept?: string;
+      concept_substituted?: boolean;
+      reported?: boolean;
+      values?: Array<{
+        form: string; filed: string; value: number; unit: string;
+        fiscal_year?: number; fiscal_period?: string;
+        period_start?: string; period_end?: string; derived?: boolean;
+      }>;
+    };
+    if (!cc || cc.reported === false || !Array.isArray(cc.values)) return null;
+    const exact = cc.values.find((v) => v.form === wantForm && v.filed === wantFiled && !v.derived);
+    if (!exact) return null;
+    return {
+      concept: cc.concept ?? friendlyConcept,
+      label: cc.label ?? null,
+      value: exact.value,
+      unit: exact.unit,
+      fiscal_year: exact.fiscal_year ?? null,
+      fiscal_period: exact.fiscal_period ?? null,
+      period_start: exact.period_start ?? null,
+      period_end: exact.period_end ?? null,
+      form: exact.form,
+      filed: exact.filed,
+      source: 'edgar_company_concept (XBRL) — same accession, not extracted from the prose above',
+      note: 'Many financial totals are reported ONLY in XBRL and never appear as an absolute dollar figure in the filing text (the prose typically states growth deltas/percentages instead) — this value is the filer\'s own XBRL fact for this exact filing, not a text match.',
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ── Insider transactions (Form 3/4/5) ───────────────────────────────
