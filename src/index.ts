@@ -3106,6 +3106,83 @@ const IFRS_FALLBACK: Record<string, string[]> = {
   equity: ['Equity', 'EquityAttributableToOwnersOfParent'],
 };
 
+// --- Liquidity companion tags (fleet #2879 / feedback #137) ----------------
+// "Cash" alone (CashAndCashEquivalentsAtCarryingValue, or its substitutes)
+// excludes marketable/short-term securities, which biotechs and other
+// cash-burning companies routinely park a large share of their runway in.
+// Verified live for Capricor (CIK 1133869, accession 0001104659-26-097294,
+// period 2026-06-30): Cash alone is $20,935,187; adding
+// AvailableForSaleSecuritiesDebtSecuritiesCurrent ($216,999,595) gets to
+// $237,934,782 — the $237.9M the reporter expected, an 11x difference from
+// the cash-only figure. Agents asking "Cash" are almost always asking a
+// runway/liquidity question, so when the resolved tag is cash-shaped, also
+// probe for marketable-securities tags at the SAME period_end and attach a
+// derived total_liquidity. Order matters: try the tag this filer is most
+// likely to use first (fewer wasted fetches); first one with any data wins.
+const CASH_LIKE_TAGS = new Set([
+  'CashAndCashEquivalentsAtCarryingValue', 'Cash',
+  'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+]);
+const MARKETABLE_SECURITIES_CURRENT_TAGS = [
+  'AvailableForSaleSecuritiesDebtSecuritiesCurrent', 'MarketableSecuritiesCurrent', 'ShortTermInvestments',
+];
+const MARKETABLE_SECURITIES_NONCURRENT_TAGS = [
+  'AvailableForSaleSecuritiesDebtSecuritiesNoncurrent', 'MarketableSecuritiesNoncurrent', 'LongTermInvestments',
+];
+
+interface LiquidityBreakdown {
+  value: number;
+  derived: true;
+  components: Record<string, number>;
+  note: string;
+}
+
+/** Full time series for one us-gaap concept, keyed by period end date (the
+ * freshest-filed fact per end date wins on duplicates). Null when the filer
+ * has no data under this exact tag (a 404 or an empty series) — callers try
+ * the next candidate tag rather than treating that as "no securities". */
+async function fetchConceptSeries(
+  paddedCik: string,
+  tag: string,
+): Promise<Map<string, { value: number; form: string; filed: string }> | null> {
+  const r = await pwFetch(
+    `${DATA_BASE}/api/xbrl/companyconcept/CIK${paddedCik}/us-gaap/${encodeURIComponent(tag)}.json`,
+    { headers: SEC_HEADERS },
+  ).catch(() => null);
+  if (!r || !r.ok) return null;
+  const doc = (await r.json()) as {
+    units?: Record<string, { end?: string; val: number; form: string; filed: string }[]>;
+  };
+  const map = new Map<string, { value: number; form: string; filed: string }>();
+  for (const values of Object.values(doc.units ?? {})) {
+    if (!Array.isArray(values)) continue;
+    for (const e of values) {
+      const key = e.end ?? '';
+      if (!key) continue;
+      const prior = map.get(key);
+      if (!prior || (e.filed ?? '') > prior.filed) map.set(key, { value: e.val, form: e.form, filed: e.filed });
+    }
+  }
+  return map.size ? map : null;
+}
+
+/** Try each candidate tag in order; return the first with any data. A filer
+ * uses exactly one of these at a time but SWITCHES over its history (Capricor
+ * reported MarketableSecuritiesCurrent through FY2025Q3, then switched to
+ * AvailableForSaleSecuritiesDebtSecuritiesCurrent from FY2025Q4 on — verified
+ * live), so trying only the newest-looking tag would miss older periods and
+ * trying only one fixed tag would miss filers who never used it. */
+async function firstAvailableSeries(
+  paddedCik: string,
+  tags: string[],
+): Promise<{ tag: string; series: Map<string, { value: number; form: string; filed: string }> } | null> {
+  for (const tag of tags) {
+    const series = await fetchConceptSeries(paddedCik, tag);
+    if (series) return { tag, series };
+  }
+  return null;
+}
+
 async function companyConcept(
   cikOrTicker: string,
   concept: string,
@@ -3380,6 +3457,7 @@ async function companyConcept(
       unit,
       derived: false as boolean | undefined,
       note: undefined as string | undefined,
+      total_liquidity: undefined as LiquidityBreakdown | undefined,
     }))
     .sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
 
@@ -3428,6 +3506,7 @@ async function companyConcept(
       unit: fyRow.unit,
       derived: true,
       note: 'Computed as FY minus Q1-Q3 — SEC filers do not report a standalone Q4 fact.',
+      total_liquidity: undefined,
     });
   }
   if (derivedQ4.length > 0) {
@@ -3444,6 +3523,78 @@ async function companyConcept(
       if (!prior || (d.fiscal_year ?? Infinity) < (prior.fiscal_year ?? Infinity)) byWindow.set(k, d);
     }
     entries.push(...byWindow.values());
+    entries.sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
+  }
+
+  // Derive STANDALONE quarters from YEAR-TO-DATE duration data (fleet #2879 /
+  // feedback #137, item 3). Income-statement concepts (Revenue, NetIncomeLoss)
+  // are usually filed quarter-only in a 10-Q and the dedup above already
+  // prefers that discrete fact over a same-day YTD one. CASH-FLOW-STATEMENT
+  // concepts (NetCashProvidedByUsedInOperatingActivities and siblings) have no
+  // discrete-quarter fact at all — US GAAP presents the cash-flow statement
+  // cumulatively, so a 10-Q's "Q2" figure IS six months, not two. Taking that
+  // as a quarterly burn rate overstates it ~2x in Q2 and ~3x in Q3. Verified
+  // live for Capricor (CIK 1133869) NetCashProvidedByUsedInOperatingActivities,
+  // FY2026: Q1 (2026-01-01..03-31) = -$29,254,891; "Q2" (2026-01-01..06-30,
+  // span 181 days — not the 80-100d a real quarter spans) = -$60,740,078. The
+  // real Q2 burn is -$31,485,187 (Q2 YTD minus Q1), roughly double what the
+  // filed Q2 figure alone would suggest if read as quarterly.
+  //
+  // Detected structurally (by span, not a hardcoded tag list, so it covers any
+  // concept a filer reports this way): anchor on a genuinely quarter-length Q1
+  // (span 80-100d), then look for a same-fiscal-year-start Q2/Q3 row whose span
+  // is ~2x/~3x a quarter (170-190d / 260-290d) — i.e. YTD-shaped. The ORIGINAL
+  // YTD-labeled row is kept as-filed; the derived standalone figure is added
+  // alongside it with form:"derived", so a caller filtering on fiscal_period
+  // sees both the as-filed YTD number and the true quarterly one, and nothing
+  // is silently replaced.
+  const standaloneQuarters: typeof entries = [];
+  for (const q1 of entries) {
+    if (q1.fiscal_period !== 'Q1' || q1.unit.includes('/')) continue;
+    const q1Span = spanDays(q1.period_start, q1.period_end);
+    if (!(q1Span >= 80 && q1Span <= 100)) continue; // Q1 YTD === Q1 quarter; this anchors the fiscal year's start date
+    const q2ytd = entries.find((e) => {
+      if (e.fiscal_period !== 'Q2' || e.unit !== q1.unit || e.period_start !== q1.period_start) return false;
+      const s = spanDays(e.period_start, e.period_end);
+      return s >= 170 && s <= 190;
+    });
+    if (!q2ytd) continue;
+    standaloneQuarters.push({
+      fiscal_year: q2ytd.fiscal_year,
+      fiscal_period: 'Q2',
+      period_start: q1.period_end,
+      period_end: q2ytd.period_end,
+      value: q2ytd.value - q1.value,
+      form: 'derived',
+      filed: q2ytd.filed,
+      unit: q2ytd.unit,
+      derived: true,
+      note: `Computed as the YTD figure filed for Q2 (${q2ytd.value}, covering ${q2ytd.period_start}..${q2ytd.period_end}) minus Q1 (${q1.value}) — this filer reports this concept cumulatively in its 10-Q (a cash-flow-statement concept, typically), not quarter-only.`,
+      total_liquidity: undefined,
+    });
+    const q3ytd = entries.find((e) => {
+      if (e.fiscal_period !== 'Q3' || e.unit !== q1.unit || e.period_start !== q1.period_start) return false;
+      const s = spanDays(e.period_start, e.period_end);
+      return s >= 260 && s <= 290;
+    });
+    if (q3ytd) {
+      standaloneQuarters.push({
+        fiscal_year: q3ytd.fiscal_year,
+        fiscal_period: 'Q3',
+        period_start: q2ytd.period_end,
+        period_end: q3ytd.period_end,
+        value: q3ytd.value - q2ytd.value,
+        form: 'derived',
+        filed: q3ytd.filed,
+        unit: q3ytd.unit,
+        derived: true,
+        note: `Computed as the YTD figure filed for Q3 (${q3ytd.value}) minus the YTD figure filed for Q2 (${q2ytd.value}) — this filer reports this concept cumulatively in its 10-Q, not quarter-only.`,
+        total_liquidity: undefined,
+      });
+    }
+  }
+  if (standaloneQuarters.length > 0) {
+    entries.push(...standaloneQuarters);
     entries.sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
   }
 
@@ -3556,6 +3707,35 @@ async function companyConcept(
   // must be the freshest fact WITHIN the period asked for, or the one field a
   // synthesizer reaches for first would answer a different year than the
   // question (fleet #2058).
+  // LIQUIDITY ENRICHMENT (fleet #2879 / feedback #137, items 1-2). Only when
+  // the resolved tag is cash-shaped — these securities tags don't apply to
+  // Revenue, LongTermDebt, etc. Mutates the row objects in place (not a copy),
+  // so `latestFact` below and `latest`/`values`/`annual_values` in the return
+  // all pick up the same enrichment without threading it through separately.
+  if (CASH_LIKE_TAGS.has(data.tag)) {
+    const [curRes, noncurRes] = await Promise.all([
+      firstAvailableSeries(paddedCik, MARKETABLE_SECURITIES_CURRENT_TAGS),
+      firstAvailableSeries(paddedCik, MARKETABLE_SECURITIES_NONCURRENT_TAGS),
+    ]);
+    if (curRes || noncurRes) {
+      for (const row of rows) {
+        if (!row.period_end) continue;
+        const cur = curRes?.series.get(row.period_end);
+        const noncur = noncurRes?.series.get(row.period_end);
+        if (!cur && !noncur) continue; // no companion data for this exact period-end — don't imply $0 securities
+        const components: Record<string, number> = { [`cash (${data.tag})`]: row.value };
+        if (cur) components[`marketable_securities_current (${curRes!.tag})`] = cur.value;
+        if (noncur) components[`marketable_securities_noncurrent (${noncurRes!.tag})`] = noncur.value;
+        row.total_liquidity = {
+          value: Object.values(components).reduce((s, v) => s + v, 0),
+          derived: true,
+          components,
+          note: 'Derived: cash plus marketable/short-term securities reported for the same period_end. Not itself an SEC-filed figure — see components for the tags and values it was summed from.',
+        };
+      }
+    }
+  }
+
   const latestFact = rows.find((e) => !e.derived) ?? null;
   let coverageBound: string | undefined;
   if (latestFact?.filed) {
