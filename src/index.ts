@@ -1854,6 +1854,23 @@ function significantTokens(name: string): string[] {
   return normName(name).split(' ').filter((t) => t.length > 1 && !GENERIC_NAME_TOKENS.has(t));
 }
 
+// 2026-10-09: shared/src/resolve.ts's rankMatches only strips '.' and ',', so
+// "BRISTOL-MYERS SQUIBB COMPANY" (hyphen kept, full "COMPANY") never matched
+// SEC's own listed title "BRISTOL MYERS SQUIBB CO" — resolved via full-text
+// fallback as no_us_registrant instead of the direct CIK 14272 hit. Do not fix
+// this in shared (used by other packs); derive a second, edgar-only candidate
+// query that also hits the hyphen (normName already strips it) and the SEC
+// house style for a trailing corporate suffix.
+const SUFFIX_TO_SEC_STYLE: Record<string, string> = {
+  COMPANY: 'CO', CORPORATION: 'CORP', INCORPORATED: 'INC', LIMITED: 'LTD',
+};
+function secStyleQuery(name: string): string {
+  const tokens = normName(name).split(' ').filter(Boolean);
+  const last = tokens[tokens.length - 1];
+  if (last && SUFFIX_TO_SEC_STYLE[last]) tokens[tokens.length - 1] = SUFFIX_TO_SEC_STYLE[last];
+  return tokens.join(' ');
+}
+
 function distinctiveToken(name: string): string {
   return significantTokens(name)[0] ?? normName(name).split(' ')[0] ?? '';
 }
@@ -1861,8 +1878,14 @@ function distinctiveToken(name: string): string {
 // SEC company names use "&", not "and". Produce query variants: &-normalized
 // full name first, then progressively drop trailing generic words (browse-edgar
 // matches on a name prefix and a too-specific full name can return nothing).
+// 2026-10-13: browse-edgar's `company=` param is a literal prefix match and
+// does NOT fold punctuation itself -- company=Bristol-Myers%20Squibb returns
+// 0 candidates while company=Bristol%20Myers%20Squibb returns CIK 14272 (the
+// filer's own listed title has no hyphen). Fold -/() to spaces before
+// querying, same characters normName() already strips for the ranking path,
+// so every query we send is already in SEC's unpunctuated house style.
 function secQueryVariants(name: string): string[] {
-  const amp = name.replace(/\band\b/gi, '&').replace(/\s+/g, ' ').trim();
+  const amp = name.replace(/\band\b/gi, '&').replace(/[-/()]/g, ' ').replace(/\s+/g, ' ').trim();
   const out = [amp];
   const words = amp.split(' ');
   for (let end = words.length; end > 1; end--) {
@@ -1880,28 +1903,99 @@ async function fetchCompanyTickers(): Promise<SecTickerRow[]> {
   return Object.values(data);
 }
 
+// Legal-form designators. A filer name carrying none of these (and no
+// descriptor word like PHARMACEUTICA / PRODUCTS / PARTNERS) in a 2-4 word
+// "Last First M" shape is an individual Form 3/4/5 reporting owner, never a
+// company's own CIK. #2998: "JANSSEN PHARMACEUTICALS INC" fell back to the
+// bare "JANSSEN" query, whose browse-edgar list is alphabetical by person
+// name, and took "Janssen Angela K" (CIK 1664284) as J&J's subsidiary.
+const LEGAL_FORM_TOKENS = new Set([
+  'INC', 'CORP', 'CO', 'COMPANY', 'CORPORATION', 'INCORPORATED', 'LTD', 'LIMITED',
+  'LLC', 'LP', 'LLP', 'PLC', 'SA', 'AG', 'NV', 'BV', 'GMBH', 'AB', 'AS', 'OY', 'SPA',
+  'SE', 'KK', 'PTE', 'PTY', 'SARL', 'SAS', 'TRUST', 'FUND', 'PARTNERSHIP',
+]);
+const COMPANY_WORDS = /\b(PHARMA\w*|THERAP\w*|BIO\w*|PRODUCTS?|PARTNERS|ASSOCIATES|CAPITAL|VENTURES|HOLDINGS?|GROUP|LABORATOR\w*|LABS|SCIENCES?|MEDICAL|HEALTH\w*|INTERNATIONAL|GLOBAL|SERVICES|SYSTEMS|TECHNOLOG\w*|INDUSTRIES|ENTERPRISES|MANAGEMENT|INVESTMENTS?|FOUNDATION|UNIVERSITY|BANK|FINANCIAL|ENERGY|RESEARCH|AMERICA|USA|US)\b/;
+
+/** Person-shaped filer name ("Janssen Angela K", "JANSSEN MICHAEL J"). */
+function isPersonShapedName(name: string): boolean {
+  const n = name.toUpperCase().replace(/\./g, '').replace(/[,&/()-]/g, ' ').replace(/\s+/g, ' ').trim();
+  const toks = n.split(' ').filter(Boolean);
+  if (toks.length < 2 || toks.length > 4) return false;
+  if (toks.some((t) => LEGAL_FORM_TOKENS.has(t) || /\d/.test(t))) return false;
+  return !COMPANY_WORDS.test(n);
+}
+
+const STOP_TOKENS = new Set(['THE', 'OF', 'AND']);
+
+// Two tokens agree when equal, or one is a >=6-char prefix of the other
+// ("PHARMACEUTICA" ~ "PHARMACEUTICALS").
+const tokAgree = (a: string, b: string): boolean =>
+  a === b || (Math.min(a.length, b.length) >= 6 && (a.startsWith(b) || b.startsWith(a)));
+
+/** Similarity of a candidate filer name to the FULL sponsor query, ignoring
+ * legal-form suffixes (INC matching INC says nothing). Significant tokens
+ * weigh 10, descriptor words (PHARMACEUTICALS, BIOTECH...) weigh 1. */
+function nameSimilarity(query: string, candidate: string): { sig: number; desc: number; score: number } {
+  const keep = (t: string) => t.length > 1 && !LEGAL_FORM_TOKENS.has(t) && !STOP_TOKENS.has(t);
+  const qAll = normName(query).split(' ').filter(keep);
+  const cAll = normName(candidate).split(' ').filter(keep);
+  const sigSet = new Set(significantTokens(query));
+  let sig = 0, desc = 0;
+  for (const q of qAll) {
+    if (!cAll.some((c) => tokAgree(q, c))) continue;
+    if (sigSet.has(q)) sig++; else desc++;
+  }
+  return { sig, desc, score: sig * 10 + desc };
+}
+
+const decodeHtml = (s: string): string =>
+  s.replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+/** browse-edgar HTML company search -> [{cik, name}]. The atom output carries
+ * no names (SEC renders them as "ARRAY(0x...)"), so a ranking by name needs
+ * the HTML list; an exact single hit renders the company page instead. */
+function parseBrowseEdgarCompanies(html: string): { cik: string; name: string }[] {
+  const out: { cik: string; name: string }[] = [];
+  const single = html.match(/<span class="companyName">([\s\S]*?)<acronym[^>]*>CIK<\/acronym>#:\s*<a[^>]*>(\d+)/);
+  if (single) return [{ cik: String(Number(single[2])), name: decodeHtml(single[1]).trim() }];
+  for (const m of html.matchAll(/CIK=(\d+)&amp;owner=include[^"]*">\d+<\/a><\/td>\s*<td scope="row">([\s\S]*?)<\/td>/g)) {
+    out.push({ cik: String(Number(m[1])), name: decodeHtml(m[2].split(/<br/i)[0]).trim() });
+  }
+  return out;
+}
+
 /** Does the sponsor name have its OWN SEC filer CIK (registered entity — a
- * subsidiary, or a private co that filed a Form D / draft S-1)? browse-edgar
- * orders by relevance so the leading <cik> tags are the closest matches; each
- * candidate is validated against its real name from the submissions API
- * (which doubles as the entity profile). Returns {cik, profile} or null. */
+ * subsidiary, or a private co that filed a Form D / draft S-1)? Candidates
+ * come from browse-edgar's company search (count=40 -- its order is
+ * alphabetical, not relevance, so the first hits of a short query are often
+ * people); individual reporting owners are dropped, the rest ranked by
+ * similarity to the FULL sponsor name, and the best are validated against
+ * their real name from the submissions API (which doubles as the entity
+ * profile). When the query carries descriptor words beyond its one
+ * distinctive token ("JANSSEN PHARMACEUTICALS"), a candidate must agree on
+ * at least one of them. Returns {cik, profile} or null. */
 async function edgarOwnCik(sponsor: string): Promise<{ cik: string; profile: EntityProfile } | null> {
   const sig = significantTokens(sponsor);
   const need = Math.min(2, sig.length || 1);
+  const queryDesc = nameSimilarity(sponsor, sponsor).desc;
+  const needDesc = sig.length <= 1 && queryDesc > 0 ? 1 : 0;
+  const passes = (s: { sig: number; desc: number }) => s.sig >= need && s.desc >= needDesc;
   for (const q of secQueryVariants(sponsor)) {
-    const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(q)}&action=getcompany&type=&dateb=&owner=include&count=10&output=atom`;
+    const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(q)}&action=getcompany&type=&dateb=&owner=include&count=40`;
     const res = await pwFetch(url, { headers: { 'User-Agent': SEC_HEADERS['User-Agent'] } }).catch(() => null);
     if (!res || !res.ok) continue;
-    const xml = await res.text();
-    const ciks = [...xml.matchAll(/<cik>(\d+)<\/cik>/gi)].map((m) => String(Number(m[1])));
-    for (const cik of [...new Set(ciks)].slice(0, 3)) {
-      const profile = await edgarEntityProfile(cik);
-      if (!profile?.name) continue;
-      const nameToks = new Set(significantTokens(profile.name));
-      const overlap = sig.filter((t) => nameToks.has(t)).length;
-      if (overlap >= need) return { cik, profile };
+    const found = parseBrowseEdgarCompanies(await res.text());
+    const ranked = found
+      .filter((c) => !isPersonShapedName(c.name))
+      .map((c, i) => ({ ...c, i, sim: nameSimilarity(sponsor, c.name) }))
+      .filter((c) => passes(c.sim))
+      .sort((a, b) => b.sim.score - a.sim.score || a.i - b.i);
+    for (const c of ranked.slice(0, 3)) {
+      const profile = await edgarEntityProfile(c.cik);
+      if (!profile?.name || isPersonShapedName(profile.name)) continue;
+      if (passes(nameSimilarity(sponsor, profile.name))) return { cik: c.cik, profile };
     }
-    if (ciks.length) break; // first variant that returned candidates is authoritative
+    if (found.length) break; // first variant that returned candidates is authoritative
   }
   return null;
 }
@@ -1972,16 +2066,24 @@ async function sponsorToFiler(sponsor: string): Promise<unknown> {
   const tickers = await fetchCompanyTickers();
 
   // 1) Direct listed match (exact / prefix / whole-word — not loose substring).
+  // Also rank a hyphen-normalized, suffix-normalized form ("Bristol-Myers
+  // Squibb Company" -> "BRISTOL MYERS SQUIBB CO") and keep whichever scores
+  // higher, so inputs that already match keep behaving exactly as before.
   const ranked = rankMatches(name, tickers, (r) => r.title);
-  if (ranked.length && ranked[0].score >= 2) {
-    const m = ranked[0].item;
+  const secStyled = secStyleQuery(name);
+  const rankedSecStyle = secStyled === name.toUpperCase() ? [] : rankMatches(secStyled, tickers, (r) => r.title);
+  const best = rankedSecStyle.length && (!ranked.length || rankedSecStyle[0].score > ranked[0].score)
+    ? rankedSecStyle
+    : ranked;
+  if (best.length && best[0].score >= 2) {
+    const m = best[0].item;
     return {
       status: 'resolved',
       method: 'direct',
-      confidence: ranked[0].score >= 3 ? 'high' : 'medium',
+      confidence: best[0].score >= 3 ? 'high' : 'medium',
       sponsor: name,
       filer: filerOut(m),
-      alternatives: ranked.slice(1, 4).map((x) => filerOut(x.item)),
+      alternatives: best.slice(1, 4).map((x) => filerOut(x.item)),
     };
   }
 
@@ -1994,24 +2096,59 @@ async function sponsorToFiler(sponsor: string): Promise<unknown> {
     }
   }
 
-  // 3) Full-text: listed filers referencing the sponsor; confirm a parent by
-  // requiring the sponsor's distinctive token in the filer's name (kills
-  // "merely mentioned by an unrelated filer" false positives).
+  // 3) Full-text: listed filers referencing the sponsor; confirm a parent.
+  // Rule A (shared_token_fulltext): the sponsor's distinctive token appears
+  // in the candidate's OWN name (kills "merely mentioned by an unrelated
+  // filer" false positives) — catches e.g. "Capricor Inc." -> "Capricor
+  // Therapeutics". This does NOT catch a brand subsidiary whose name shares
+  // no word with its parent ("Janssen" / "Johnson & Johnson", "Merck Sharp
+  // and Dohme" is the one case that happens to share "Merck") — for that we
+  // never promote on mention-count alone (a press/litigation mention is not
+  // ownership); we ask SEC's own authoritative source instead: does the
+  // dominant candidate's latest 10-K Exhibit 21 subsidiary list (Item
+  // 601(b)(21)) name the sponsor? Rule B (ex21_subsidiary_match) fires only
+  // then, and only against the single dominant candidate, so a genuine miss
+  // never pays for an extra filing+exhibit fetch. #2971.
   const ft = await fullTextListedFilers(name).catch(() => ({ candidates: [] as ListedFiler[], total: 0 }));
-  const confirmed = ft.candidates.find((c) => normName(c.name).split(' ').includes(disc));
+  let confirmed = ft.candidates.find((c) => normName(c.name).split(' ').includes(disc));
+  let rule: 'shared_token_fulltext' | 'ex21_subsidiary_match' | null = confirmed ? 'shared_token_fulltext' : null;
+  let ex21Match: string | null = null;
+
+  if (!confirmed && ft.candidates.length) {
+    const top = ft.candidates[0];
+    const second = ft.candidates[1];
+    // Dominance gate before spending the EX-21 fetch: top mention count must
+    // be meaningful on its own AND clearly ahead of the runner-up.
+    const dominant = top.hits >= 5 && (!second || top.hits >= 3 * second.hits);
+    if (dominant) {
+      ex21Match = await exhibit21NamesSponsor(top.cik, name).catch(() => null);
+      if (ex21Match) {
+        confirmed = top;
+        rule = 'ex21_subsidiary_match';
+      }
+    }
+  }
+
   if (confirmed) {
+    const directMatch = own ? { cik: own.cik, name: own.profile?.name ?? null, listed: false } : null;
     return {
       status: 'resolved_via_parent',
-      method: 'subsidiary_fulltext',
+      method: rule === 'ex21_subsidiary_match' ? 'subsidiary_exhibit21' : 'subsidiary_fulltext',
+      rule,
       confidence: confirmed.hits >= 10 ? 'high' : 'medium',
       sponsor: name,
       filer: { company_name: confirmed.name, ticker: confirmed.ticker, cik: confirmed.cik, cik_padded: confirmed.cik.padStart(10, '0') },
+      parent_filer: { company_name: confirmed.name, ticker: confirmed.ticker, cik: confirmed.cik, cik_padded: confirmed.cik.padStart(10, '0') },
+      direct_match: directMatch,
       evidence: {
         parent_mention_filings: confirmed.hits,
         distinctive_token: disc,
         own_subsidiary_cik: own?.cik ?? null,
         own_subsidiary_name: own?.profile?.name ?? null,
-        note: 'Sponsor appears to be an operating subsidiary. Resolved to the listed parent whose SEC filings reference it and whose name shares the sponsor\'s distinctive token.',
+        exhibit_21_subsidiary_name: ex21Match,
+        note: rule === 'ex21_subsidiary_match'
+          ? `"${name}" is named as a subsidiary in ${confirmed.name}'s own SEC Exhibit 21 filing (as "${ex21Match}") -- the authoritative ownership disclosure, used because the two names share no common word.`
+          : 'Sponsor appears to be an operating subsidiary. Resolved to the listed parent whose SEC filings reference it and whose name shares the sponsor\'s distinctive token.',
       },
       alternatives: ft.candidates.slice(0, 3).map((c) => ({ company_name: c.name, ticker: c.ticker, cik: c.cik, mention_filings: c.hits })),
     };
@@ -4464,6 +4601,45 @@ function parseSubsidiaryTable(html: string): Subsidiary[] {
     out.push({ name, jurisdiction: jurisdiction || null });
   }
   return out;
+}
+
+// Used by sponsor_to_filer (#2971) to confirm a dominant full-text-mention
+// candidate as the sponsor's real listed parent via SEC's own authoritative
+// ownership disclosure, for the case where the subsidiary's name shares no
+// word with its parent's (Janssen / Johnson & Johnson). Walks the SAME path
+// as filer_to_sponsors (latest 10-K -> -index.html -> EX-21 -> parsed table)
+// but stops at the first subsidiary whose name shares a significant token
+// with the sponsor, rather than returning the whole list. One filing fetch +
+// one exhibit fetch, bounded by the caller's dominance gate so it only runs
+// against a serious candidate. Returns the matching subsidiary's own EX-21
+// name, or null (no 10-K / no EX-21 / didn't parse / sponsor not listed).
+async function exhibit21NamesSponsor(cik: string, sponsorName: string): Promise<string | null> {
+  const paddedCik = padCik(cik);
+  const subRes = await pwFetch(`${DATA_BASE}/submissions/CIK${paddedCik}.json`, { headers: SEC_HEADERS });
+  if (!subRes.ok) return null;
+  const sub = (await subRes.json()) as {
+    filings?: { recent?: { accessionNumber?: string[]; form?: string[] } };
+  };
+  const forms = sub.filings?.recent?.form ?? [];
+  const accs = sub.filings?.recent?.accessionNumber ?? [];
+  const idx10k = forms.findIndex((f) => f === '10-K' || f === '10-K/A');
+  if (idx10k < 0) return null;
+  const accession = accs[idx10k];
+  if (!accession) return null;
+  const accessionPath = accession.replace(/-/g, '');
+  const cikNoZeros = String(Number(cik));
+  const folder = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accessionPath}`;
+  const idxRes = await pwFetch(`${folder}/${accession}-index.html`, { headers: SEC_HEADERS });
+  if (!idxRes.ok) return null;
+  const exUrl = findExhibit21Url(await idxRes.text());
+  if (!exUrl) return null;
+  const exRes = await pwFetch(exUrl, { headers: { 'User-Agent': SEC_HEADERS['User-Agent'] } });
+  if (!exRes.ok) return null;
+  const parsed = parseSubsidiaryTable(await exRes.text());
+  const sig = new Set(significantTokens(sponsorName));
+  if (!sig.size) return null;
+  const hit = parsed.find((s) => significantTokens(s.name).some((t) => sig.has(t)));
+  return hit ? hit.name : null;
 }
 
 async function filerToSponsors(
