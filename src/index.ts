@@ -699,6 +699,16 @@ const normalize = (s: string): string =>
  * exact (4) > prefix (3) > whole-word (2) > substring (1). Ties break by shortest
  * name — the primary entity (e.g. "Apple Inc." over "Apple Hospitality REIT").
  * Returns only items that match at all, best first. Pure (no I/O).
+ *
+ * `prefix` requires a WORD BOUNDARY (`n.startsWith(q + ' ')`), not a bare
+ * `startsWith`. A bare `startsWith` let "ZOOM" claim "ZOOMCAR HOLDINGS INC" at
+ * the SAME tier as "Apple" claiming "APPLE INC." — "Zoomcar" is a different
+ * word that happens to begin with the same letters, not the brand name plus a
+ * corporate-form suffix. That conflation is what sent resolve_entity("Zoom")
+ * to Zoomcar and resolve_entity("Audi") to AudioEye Inc (fleet #2776's
+ * mis-resolution fixture) — both now correctly fall through to the weaker
+ * `substring` tier instead of tying with a genuine word-boundary prefix hit
+ * like "Palantir" -> "Palantir Technologies Inc." (fleet #3100).
  */
 function rankMatches<T>(
   query: string,
@@ -714,7 +724,7 @@ function rankMatches<T>(
     let kind: MatchKind | null = null;
     let score = 0;
     if (n === q) { kind = 'exact'; score = 4; }
-    else if (n.startsWith(q)) { kind = 'prefix'; score = 3; }
+    else if (n.startsWith(`${q} `)) { kind = 'prefix'; score = 3; }
     else if (n.includes(` ${q} `) || n.endsWith(` ${q}`)) { kind = 'word'; score = 2; }
     else if (n.includes(q)) { kind = 'substring'; score = 1; }
     if (kind) scored.push({ item, kind, score, len: name.length });
@@ -731,7 +741,15 @@ interface SecEntity {
   cik_padded: string;
   company_name: string;
   matched_by: 'ticker' | 'company_name';
-  alternatives?: { ticker: string; company_name: string; cik: string }[];
+  /**
+   * The `rankMatches` kind that won, when `matched_by` is `'company_name'`
+   * (a ticker hit has no kind — it did not go through ranking at all). Lets a
+   * caller tell a word-boundary PREFIX hit ("Palantir" -> "Palantir
+   * Technologies Inc.") from a weaker `word`/`substring` guess, which
+   * `matched_by: 'company_name'` alone cannot (fleet #3100).
+   */
+  matched_kind?: MatchKind;
+  alternatives?: { ticker: string; company_name: string; cik: string; kind: MatchKind }[];
 }
 
 const SEC_TICKERS_URL = 'https://www.sec.gov/files/company_tickers.json';
@@ -767,10 +785,12 @@ async function resolveSecEntity(
   const ranked = rankMatches(query, rows, (r) => r.title);
   if (ranked.length) {
     const best = toEntity(ranked[0].item, 'company_name');
+    best.matched_kind = ranked[0].kind;
     const alts = ranked.slice(1, 4).map((m) => ({
       ticker: m.item.ticker,
       company_name: m.item.title,
       cik: String(m.item.cik_str),
+      kind: m.kind,
     }));
     if (alts.length) best.alternatives = alts;
     return best;

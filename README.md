@@ -2,7 +2,7 @@
 
 The Securities and Exchange Commission's filings database. Every public company in the US files here, every filing is timestamped and immutable, and every disclosure (revenue, debt, risk factors, executive compensation, M&A activity, insider trading) is structured for machine retrieval. Free and authoritative.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1784+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1807+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Why this matters for AI agents
 
@@ -106,7 +106,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1784+ data sources. The
+Both URLs reach the same gateway and the same 1807+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
