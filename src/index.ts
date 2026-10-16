@@ -1258,7 +1258,7 @@ const tools: McpToolExport['tools'] = [
         concept: {
           type: 'string',
           description:
-            'REQUIRED (alias `metric`). Metric name. Common: "Revenue" / "Revenues", "NetIncomeLoss", "Cash", "Assets", "Liabilities", "StockholdersEquity", "EarningsPerShareDiluted", "LongTermDebt".',
+            'REQUIRED (alias `metric`). Metric name. Common: "Revenue" / "Revenues", "NetIncomeLoss", "Cash", "Assets", "Liabilities", "StockholdersEquity", "EarningsPerShareDiluted", "LongTermDebt", "SharesOutstanding" (newest cover-page count, dei), "Capex", "OperatingCashFlow", "ResearchAndDevelopment", "SGA", "CostOfRevenue", "DilutedShares", "PublicFloat". Exact us-gaap or dei tag names also work.',
         },
         period: {
           type: 'string',
@@ -3148,6 +3148,17 @@ async function companyFacts(cikOrTicker: string) {
 // Anything not in the table still falls through to [concept] (the bare
 // literal), so we don't regress for niche concepts not yet observed in
 // failures.
+// Cover-page tags live in the `dei` taxonomy, not us-gaap. Until 2026-10-16
+// every candidate was fetched under /us-gaap/, so the dei tag listed below for
+// "shares outstanding" 404'd on every filer and
+// edgar_company_concept({concept:"EntityCommonStockSharesOutstanding"}) told
+// callers "this filer reports no XBRL tag matching ..." for Tesla, which has 67
+// such facts (latest 3,949,547,394 at 2026-07-16). A report built on that
+// answer took the share count from a stale 10-Q cover instead and was off 5%
+// on every per-share number. Resolve the namespace per TAG, not per lookup.
+const DEI_TAGS = new Set(['EntityCommonStockSharesOutstanding', 'EntityPublicFloat']);
+const namespaceForTag = (defaultNs: string, tag: string): string => (DEI_TAGS.has(tag) ? 'dei' : defaultNs);
+
 const CONCEPT_CANDIDATES: Record<string, string[]> = {
   // ── friendly names ────────────────────────────────────────────────
   revenue: ['RevenueFromContractWithCustomerExcludingAssessedTax', 'Revenues', 'SalesRevenueNet'],
@@ -3165,6 +3176,31 @@ const CONCEPT_CANDIDATES: Record<string, string[]> = {
   sharesoutstanding: ['CommonStockSharesOutstanding', 'EntityCommonStockSharesOutstanding', 'CommonStockSharesIssued'],
   commonsharesoutstanding: ['CommonStockSharesOutstanding', 'EntityCommonStockSharesOutstanding', 'CommonStockSharesIssued'],
   commonstocksharesoutstanding: ['CommonStockSharesOutstanding', 'EntityCommonStockSharesOutstanding'],
+  // The cash-flow and expense lines an equity model needs. Measured 2026-10-16:
+  // a routed "Tesla capex Q2 2026" question reached this tool as
+  // concept:"CapitalExpenditures", which no filer tags, and the answer was
+  // "reports no matching XBRL tag" — a miss on a figure every 10-Q carries as
+  // PaymentsToAcquirePropertyPlantAndEquipment. The report that asked went to a
+  // third-party site for it instead.
+  capex: ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements'],
+  capitalexpenditure: ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements'],
+  capitalexpenditures: ['PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsToAcquireProductiveAssets', 'PaymentsForCapitalImprovements'],
+  operatingcashflow: ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
+  cashfromoperations: ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
+  netcashfromoperatingactivities: ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
+  netcashprovidedbyoperatingactivities: ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
+  researchanddevelopment: ['ResearchAndDevelopmentExpense', 'ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost'],
+  researchanddevelopmentexpense: ['ResearchAndDevelopmentExpense', 'ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost'],
+  sga: ['SellingGeneralAndAdministrativeExpense'],
+  sellinggeneralandadministrative: ['SellingGeneralAndAdministrativeExpense'],
+  costofrevenue: ['CostOfRevenue', 'CostOfGoodsAndServicesSold', 'CostOfGoodsSold'],
+  costofgoodssold: ['CostOfGoodsAndServicesSold', 'CostOfGoodsSold', 'CostOfRevenue'],
+  cogs: ['CostOfGoodsAndServicesSold', 'CostOfGoodsSold', 'CostOfRevenue'],
+  dilutedshares: ['WeightedAverageNumberOfDilutedSharesOutstanding'],
+  weightedaveragedilutedshares: ['WeightedAverageNumberOfDilutedSharesOutstanding'],
+  basicshares: ['WeightedAverageNumberOfSharesOutstandingBasic'],
+  weightedaveragebasicshares: ['WeightedAverageNumberOfSharesOutstandingBasic'],
+  publicfloat: ['EntityPublicFloat'],
   cash: [
     'CashAndCashEquivalentsAtCarryingValue',
     'Cash',
@@ -3419,7 +3455,7 @@ async function companyConcept(
   const tryNamespace = async (ns: string, tags: string[]) => {
     for (const candidate of tags) {
       const r = await pwFetch(
-        `${DATA_BASE}/api/xbrl/companyconcept/CIK${paddedCik}/${ns}/${encodeURIComponent(candidate)}.json`,
+        `${DATA_BASE}/api/xbrl/companyconcept/CIK${paddedCik}/${namespaceForTag(ns, candidate)}/${encodeURIComponent(candidate)}.json`,
         { headers: SEC_HEADERS },
       );
       if (!r.ok) { lastStatus = r.status; continue; }
@@ -3458,12 +3494,18 @@ async function companyConcept(
     if (!factsRes.ok) {
       lastStatus = factsRes.status;
     } else if (tokens.length) {
-      const facts = (await factsRes.json()) as { entityName?: string; facts?: { 'us-gaap'?: Record<string, { label?: string; description?: string; units: Record<string, ConceptDoc['units'][string]> }> } };
+      type FactsNs = Record<string, { label?: string; description?: string; units: Record<string, ConceptDoc['units'][string]> }>;
+      const facts = (await factsRes.json()) as { entityName?: string; facts?: { 'us-gaap'?: FactsNs; dei?: FactsNs } };
       resolvedEntityName = facts.entityName ?? '';
-      const gaap = facts.facts?.['us-gaap'] ?? {};
+      // Scan dei too: cover-page facts (shares outstanding, public float) are
+      // reported there and nowhere in us-gaap for many filers.
+      const scanNamespaces: [string, FactsNs][] = [
+        ['us-gaap', facts.facts?.['us-gaap'] ?? {}],
+        ['dei', facts.facts?.dei ?? {}],
+      ];
       const FLOW = /^(ProceedsFrom|RepaymentsOf|PaymentsOf|IncreaseDecrease|AmortizationOf|Gain|Loss)/;
       const matches: { isFlow: boolean; latestEnd: string; doc: ConceptDoc }[] = [];
-      for (const [tag, entry] of Object.entries(gaap)) {
+      for (const [scanNs, nsFacts] of scanNamespaces) for (const [tag, entry] of Object.entries(nsFacts)) {
         if (!tokens.some((t) => norm(tag).includes(t))) continue;
         let latestEnd = '';
         for (const [, values] of unitEntries(entry.units)) {
@@ -3475,7 +3517,7 @@ async function companyConcept(
         matches.push({
           isFlow: FLOW.test(tag),
           latestEnd,
-          doc: { cik: Number(cik), entityName: facts.entityName ?? '', tag, taxonomy: 'us-gaap', label: entry.label ?? tag, description: entry.description ?? '', units: entry.units },
+          doc: { cik: Number(cik), entityName: facts.entityName ?? '', tag, taxonomy: scanNs, label: entry.label ?? tag, description: entry.description ?? '', units: entry.units },
         });
       }
       matches.sort((a, b) => Number(a.isFlow) - Number(b.isFlow) || (b.latestEnd ?? '').localeCompare(a.latestEnd ?? ''));
@@ -3556,7 +3598,7 @@ async function companyConcept(
       reported: false,
       latest: null,
       values: [],
-      note: `This filer reports no XBRL tag matching "${concept}" under any recognized name — checked us-gaap candidates ${JSON.stringify(candidates)}, IFRS, and a full company-facts name scan. This means EITHER the company genuinely has none (common for e.g. long-term debt at equity-funded filers) OR it reports the item under a tag we didn't match (e.g. convertible/other debt lines). value is null, not zero — call edgar_company_facts({cik:"${cikOrTicker}"}) to see the exact tags this filer uses before treating it as absent.`,
+      note: `This filer reports no XBRL tag matching "${concept}" under any recognized name — checked us-gaap/dei candidates ${JSON.stringify(candidates)}, IFRS, and a full company-facts name scan (us-gaap and dei). This means EITHER the company genuinely has none (common for e.g. long-term debt at equity-funded filers) OR it reports the item under a tag we didn't match (e.g. convertible/other debt lines). value is null, not zero — call edgar_company_facts({cik:"${cikOrTicker}"}) to see the exact tags this filer uses before treating it as absent.`,
     };
   }
   found.sort((a, b) => (b.latestEnd ?? '').localeCompare(a.latestEnd ?? ''));
@@ -3611,6 +3653,17 @@ async function companyConcept(
       value: entry.val,
       form: entry.form, // 10-K / 10-Q / 20-F / 40-F (+ /A amendments)
       filed: entry.filed,
+      // Which filing this exact number came out of (fleet #3178). SEC's
+      // companyconcept payload carries `accn` on every fact and we were
+      // dropping it, so a caller holding a value and a period_end had no way
+      // back to the document without a second edgar_company_filings call and
+      // a date match — and a consumer that FANS OUT over this tool
+      // (entity_profile's fundamentals) could not cite its own figures at all.
+      // Reported rows only: a derived Q4/standalone-quarter row below is
+      // arithmetic over several filings, not a fact any one of them states, so
+      // it carries `accession: undefined` rather than the accession of
+      // whichever leg happened to be the minuend.
+      accession: entry.accn as string | undefined,
       unit,
       derived: false as boolean | undefined,
       note: undefined as string | undefined,
@@ -3660,6 +3713,7 @@ async function companyConcept(
       value: fyRow.value - qSum,
       form: 'derived',
       filed: fyRow.filed,
+      accession: undefined, // arithmetic over FY + Q1-Q3, not a fact one filing states
       unit: fyRow.unit,
       derived: true,
       note: 'Computed as FY minus Q1-Q3 — SEC filers do not report a standalone Q4 fact.',
@@ -3724,6 +3778,7 @@ async function companyConcept(
       value: q2ytd.value - q1.value,
       form: 'derived',
       filed: q2ytd.filed,
+      accession: undefined, // YTD(Q2) minus Q1 — spans two filings
       unit: q2ytd.unit,
       derived: true,
       note: `Computed as the YTD figure filed for Q2 (${q2ytd.value}, covering ${q2ytd.period_start}..${q2ytd.period_end}) minus Q1 (${q1.value}) — this filer reports this concept cumulatively in its 10-Q (a cash-flow-statement concept, typically), not quarter-only.`,
@@ -3743,6 +3798,7 @@ async function companyConcept(
         value: q3ytd.value - q2ytd.value,
         form: 'derived',
         filed: q3ytd.filed,
+        accession: undefined, // YTD(Q3) minus YTD(Q2) — spans two filings
         unit: q3ytd.unit,
         derived: true,
         note: `Computed as the YTD figure filed for Q3 (${q3ytd.value}) minus the YTD figure filed for Q2 (${q2ytd.value}) — this filer reports this concept cumulatively in its 10-Q, not quarter-only.`,
@@ -3843,8 +3899,18 @@ async function companyConcept(
   // neither the caller nor any automatic check can tell it apart". A
   // substituted tag is the same shape, and gets the same treatment.
   const requested = concept.trim();
-  const substituted = requested.length > 0
-    && data.tag.toLowerCase().replace(/[^a-z0-9]/g, '') !== requested.toLowerCase().replace(/[^a-z0-9]/g, '');
+  // A friendly name the tool itself documents ("shares outstanding", "revenue")
+  // resolving to one of ITS OWN listed tags is the advertised behaviour, not a
+  // substitution — the warning below is for the fuzzy name-scan path, where a
+  // narrower tag really can stand in for a broader concept. Until 2026-10-16
+  // "shares outstanding" → CommonStockSharesOutstanding carried the full "NOT
+  // interchangeable" warning on a correct answer.
+  const requestedKey = requested.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const aliasServed = (CONCEPT_CANDIDATES[requestedKey] ?? []).some(
+    (t) => t.toLowerCase() === data.tag.toLowerCase(),
+  );
+  const substituted = requested.length > 0 && !aliasServed
+    && data.tag.toLowerCase().replace(/[^a-z0-9]/g, '') !== requestedKey;
 
   // Coverage-bound disclosure (fleet #693). A returned value can be genuinely
   // CURRENT for this exact XBRL tag while a newer periodic filing exists that
