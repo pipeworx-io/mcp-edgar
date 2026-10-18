@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -1181,7 +1268,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_company_filings',
     description:
-      'AUTHORITATIVE list of recent SEC filings for a specific US public company. Send the company as `ticker_or_cik` — that argument takes a ticker ("AAPL") or a CIK ("320193"), and `cik` / `ticker` are accepted as aliases for it. Filter by form type — "10-K" (annual report), "10-Q" (quarterly), "8-K" (material event — but for severity-classified 8-Ks specifically, prefer sec_8k_recent), "DEF 14A" (proxy), "S-1" (IPO registration), etc. Returns filing dates, form types, accession numbers, document links. Use for "what did $TICKER recently file" or "show me the last N proxy statements for $TICKER". For specific financial metrics over time use edgar_company_concept; for the full XBRL dump use edgar_company_facts. If you also need the headline financials alongside the filings, edgar_company_snapshot returns both in one call.',
+      'AUTHORITATIVE list of recent SEC filings for a specific US public company. Send the company as `ticker_or_cik` — that argument takes a ticker ("AAPL") or a CIK ("320193"), and `cik` / `ticker` are accepted as aliases for it. **When the question is about ONE filing rather than the list, say which one**: pass `accession` to narrow to it, or `filed` ("2026-09-29", "2026-09") when you know only the date, and add `include_primary_text:true` to get that filing\'s text back here instead of chaining a second call. Filter by form type — "10-K" (annual report), "10-Q" (quarterly), "8-K" (material event — but for severity-classified 8-Ks specifically, prefer sec_8k_recent), "DEF 14A" (proxy), "S-1" (IPO registration), etc. Returns filing dates, form types, accession numbers, document links. Use for "what did $TICKER recently file" or "show me the last N proxy statements for $TICKER". For specific financial metrics over time use edgar_company_concept; for the full XBRL dump use edgar_company_facts. If you also need the headline financials alongside the filings, edgar_company_snapshot returns both in one call.',
     summary: 'Every SEC filing a US public company has made, newest first.',
     inputSchema: {
       type: 'object' as const,
@@ -1195,6 +1282,18 @@ const tools: McpToolExport['tools'] = [
           description: 'Filter by SEC form type (e.g., "10-K", "10-Q", "8-K"). Omit for all types.',
         },
         limit: { type: 'number', description: 'Max filings to return (1-40, default 20)' },
+        accession: {
+          type: 'string',
+          description: 'Narrow the list to ONE filing you already know the accession of, dashed or not (e.g. "0001628280-26-063820") — use this when the question is about a specific filing rather than "what has this company filed". Pair it with `include_primary_text:true` to get that filing\'s text back in the same call. A named accession that does not belong to this filer is an explicit error, never a silently unfiltered list.',
+        },
+        include_primary_text: {
+          type: 'boolean',
+          description: 'When true, also return the primary document\'s text (HTML stripped to plaintext, capped at ~40,000 chars) under `primary_text`, for the SINGLE filing `accession` names. Ignored — with a note saying so — when no accession narrows the list, since the text of twenty filings is not a thing this tool returns; use edgar_filing_text for that.',
+        },
+        filed: {
+          type: 'string',
+          description: 'Only filings filed on this date, in this month, or in this year — "2026-09-29", "2026-09", "2026" (US spellings "09/29/2026" and "September 29, 2026" are accepted too). Use it when the question names WHEN ("Tesla\'s September 29 2026 8-K") and you do not have the accession: without it the newest filing of that form is returned, which for an 8-K is routinely a different filing from the one asked about.',
+        },
         cik: {
           type: 'string',
           description: 'Alias for `ticker_or_cik` — the spelling edgar_company_concept and edgar_company_facts use for the same thing. Takes a ticker or a CIK.',
@@ -1577,7 +1676,7 @@ const tools: McpToolExport['tools'] = [
       properties: {
         accession: {
           type: 'string',
-          description: 'Optional SEC accession number of a specific filing, with or without dashes (e.g. "0000320193-25-000079"). Omit it to auto-resolve the latest filing — pass form_type instead.',
+          description: 'Optional SEC accession number of a specific filing, with or without dashes (e.g. "0000320193-25-000079"). Omit it to auto-resolve the latest filing — pass form_type instead, and the response will say `accession_source:"auto_selected"` and list under `auto_selected.candidates` the other filings you might have meant. If the question names WHICH filing (a date, "the September 29 8-K"), pass `filed` or the accession rather than relying on that choice.',
         },
         ticker: {
           type: 'string',
@@ -1591,6 +1690,11 @@ const tools: McpToolExport['tools'] = [
           type: 'string',
           description: 'When accession is omitted, the form type of the latest filing to fetch, e.g. "10-K", "10-Q", "8-K", "DEF 14A" — or a `|`-separated SET ("10-K|10-Q") for "the most recent of either, whichever is newer". Omit both accession and form_type to get the single most recent filing of ANY type at all (routine 8-Ks/Form 4s/Form 144s included, not just annual/quarterly reports) — use the `|` set instead when you specifically want the newest 10-K or 10-Q.',
         },
+        filed: {
+          type: 'string',
+          description: 'Only consider filings filed on this date, in this month, or in this year — "2026-09-29", "2026-09", "2026" (US spellings "09/29/2026" and "September 29, 2026" accepted). **Pass this whenever the question names a date** ("Tesla\'s September 29 2026 8-K"): without it the NEWEST filing of that form is used, and for an 8-K that is routinely a different filing.',
+        },
+        filing_date: { type: 'string', description: 'Alias for `filed`.' },
         include_primary_text: {
           type: 'boolean',
           description: 'When true, also fetch the primary document and return its text (HTML stripped to plaintext, truncated to ~40,000 chars). Default false. For the FULL, pageable document text — or just one section like going-concern/liquidity — use edgar_filing_text instead.',
@@ -1606,15 +1710,20 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_text',
     description:
-      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. **For a question asking two facts from the same filing** ("revenue and test volume in the latest 10-Q"), pass `search` as `|`-separated phrases (e.g. "revenue|tests processed") to get both in this one call under `searches[]` — and when a phrase names a financial total (revenue, net income, EPS, ...), the matching XBRL figure for this exact accession comes back under `xbrl` even if that total never appears as an absolute number in the prose (common: filings often state only the growth delta/percentage in text). Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
+      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. A `search` response carries ONLY the matched passages, so it reports `returned_chars` against `total_chars` and sets `truncated:true` whenever those differ — read a figure\'s absence from it as "the phrase did not match there", never as "the filing does not say it", and re-read without `search` (or at a passage `offset`) to confirm. (Do not read `search.truncated` as a completeness signal: it is about the SEARCH — false means every distinct match location was returned — and is routinely false on a response holding a third of the document.) **For a question asking two facts from the same filing** ("revenue and test volume in the latest 10-Q"), pass `search` as `|`-separated phrases (e.g. "revenue|tests processed") to get both in this one call under `searches[]` — and when a phrase names a financial total (revenue, net income, EPS, ...), the matching XBRL figure for this exact accession comes back under `xbrl` even if that total never appears as an absolute number in the prose (common: filings often state only the growth delta/percentage in text). Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
     summary: 'The full text of an SEC filing\'s main document, HTML stripped to clean plaintext.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         accession: {
           type: 'string',
-          description: 'SEC accession number, dashed or not (e.g. "0001683168-26-003909"). Omit to auto-resolve the latest filing of form_type for the given ticker/cik.',
+          description: 'SEC accession number, dashed or not (e.g. "0001683168-26-003909"). Omit to auto-resolve the latest filing of form_type for the given ticker/cik — the response then says `accession_source:"auto_selected"` and lists under `auto_selected.candidates` the other filings you might have meant. If the question names WHICH filing (a date, "the September 29 8-K"), pass `filed` or an accession instead of relying on that choice.',
         },
+        filed: {
+          type: 'string',
+          description: 'Only consider filings filed on this date, in this month, or in this year — "2026-09-29", "2026-09", "2026" (US spellings "09/29/2026" and "September 29, 2026" accepted). **Pass this whenever the question names a date** ("Tesla\'s September 29 2026 8-K"): without it the NEWEST filing of that form is read, and for an 8-K that is routinely a different filing — verified live 2026-10-18, the newest TSLA 8-K was six days later, 3,061 chars, and contained none of the credit-facility figures asked about.',
+        },
+        filing_date: { type: 'string', description: 'Alias for `filed`.' },
         ticker: {
           type: 'string',
           description: 'Filer ticker (e.g. "ACTU"). Provide this OR cik. ONLY pass a ticker you are CERTAIN of — a wrong remembered ticker silently retrieves a DIFFERENT company\'s filing as a clean success (a "SpaceX" question filled with SPCE returns Virgin Galactic\'s S-1). For a recent IPO or any uncertain ticker, resolve first: edgar_company_filings accepts the company NAME and returns the cik — pass that cik here.',
@@ -2303,13 +2412,100 @@ function recentFilingRows(data: SubmissionsPayload, keep: (form: string) => bool
   return filings;
 }
 
-async function companyFilings(tickerOrCik: string, formType?: string, limit?: number) {
+async function companyFilings(
+  tickerOrCik: string,
+  formType?: string,
+  limit?: number,
+  accession?: string,
+  includePrimaryText?: boolean,
+  filed?: string,
+) {
   const cik = await resolveCik(tickerOrCik);
   const paddedCik = padCik(cik);
   const count = Math.min(40, Math.max(1, limit ?? 20));
 
   const data = await fetchSubmissions(tickerOrCik, paddedCik);
-  const filings = recentFilingRows(data, (form) => !formType || form === formType, count);
+
+  // ── A NAMED FILING IS NOT A FILTER SUGGESTION (fleet #3319) ──────────────
+  //
+  // `accession` and `include_primary_text` used to be undeclared here, so a
+  // caller that named a filing got the same unnarrowed list as one that named
+  // nothing — the silently-ignored-filter-key failure, which returns HTTP 200
+  // and reads as a clean success. Measured live 2026-10-18 on
+  // ask_pipeworx_grounded: its last ladder attempt routed to this tool with
+  // {accession:"0001628280-26-063820", ticker:"TSLA", include_primary_text:true}
+  // — the router had already resolved the RIGHT 8-K — and the extraction model
+  // received a 10-row filings list carrying no facility amounts and refused
+  // `not_in_source`, 5 tries out of 5. The accession was in our hands the whole
+  // time.
+  const wantAcc = accession ? normalizeAccession(accession) : null;
+  if (accession && !wantAcc) {
+    throw new Error(
+      `Invalid accession "${accession}". A SEC accession number is 18 digits shaped 10-2-6 (e.g. "0001628280-26-063820", with or without dashes). Omit it to list this filer's recent filings, or pass \`filed\` ("2026-09-29") if you know only the date.`,
+    );
+  }
+  const filedPrefix = normalizeFiledPrefix(filed);
+  if (filed && !filedPrefix) {
+    throw new Error(
+      `Could not read "${filed}" as a filing date. Pass an ISO date, month or year — "2026-09-29", "2026-09", "2026" — or the US spellings "09/29/2026" / "September 29, 2026".`,
+    );
+  }
+
+  const formKeep = (form: string) => !formType || formType.toLowerCase() === 'all' || form === formType;
+  let filings = recentFilingRows(data, formKeep, wantAcc || filedPrefix ? 40 : count);
+  const totalBeforeNarrowing = filings.length;
+  if (wantAcc) {
+    const hit = filings.filter((f) => normalizeAccession(f.accession_number)?.dashed === wantAcc.dashed);
+    if (!hit.length) {
+      // Loud, not an unfiltered list: an accession this filer has not filed is
+      // a wrong question, and answering it with somebody else's filings is how
+      // a caller ends up quoting the wrong document.
+      throw new Error(
+        `not_found: accession ${wantAcc.dashed} is not among ${data.name}'s recent filings${formType && formType.toLowerCase() !== 'all' ? ` of form ${formType}` : ''}. Drop \`accession\` to list what this filer HAS filed (the recent index covers roughly the last 1,000 filings), or check the digits — an accession belongs to exactly one filer.`,
+      );
+    }
+    filings = hit;
+  } else if (filedPrefix) {
+    filings = filings.filter((f) => (f.filing_date ?? '').startsWith(filedPrefix)).slice(0, count);
+    if (!filings.length) {
+      throw new Error(
+        `not_found: ${data.name} has no${formType && formType.toLowerCase() !== 'all' ? ` ${formType}` : ''} filing dated ${filedPrefix} in SEC's recent index (${totalBeforeNarrowing} candidate filing(s) were checked). Widen the date ("${filedPrefix.slice(0, 7)}" for the whole month) or drop \`filed\` to see what is actually there.`,
+      );
+    }
+  }
+
+  // `include_primary_text` is only answerable for ONE filing. Say which way it
+  // went rather than returning a list and leaving the caller to notice the
+  // field is missing (silent-zero policy).
+  let primaryText: string | null = null;
+  let primaryTextNote: string | null = null;
+  if (includePrimaryText) {
+    if (filings.length === 1) {
+      const only = filings[0];
+      try {
+        const { text: body, truncated: rawTrunc } = await fetchTextBounded(
+          only.document_url,
+          { 'User-Agent': SEC_HEADERS['User-Agent'] },
+          FILING_DOC_MAX_BYTES,
+        );
+        const isHtml = /\.x?html?$/i.test(only.primary_document) || /^\s*</.test(body);
+        const text = isHtml ? htmlToText(body) : body;
+        primaryText = text.slice(0, 40000);
+        if (text.length > 40000 || rawTrunc) {
+          primaryTextNote = `primary_text is the first 40,000 of ${text.length} characters${rawTrunc ? ' of the portion of an oversized document that was read at all' : ''} — NOT the whole document. Read the rest with edgar_filing_text({accession:"${only.accession_number}", ticker_or_cik:"${tickerOrCik}", offset:40000}).`;
+        }
+      } catch (err) {
+        // The list is the core payload; a failed text fetch degrades with a
+        // stated reason rather than failing the whole call.
+        // dropClassPrefix: this is a NOTE fragment, not the call's error — the
+        // call succeeded. A routing token carried in here would be read by the
+        // gateway's classifier as this response's class, which it is not.
+        primaryTextNote = `primary_text could not be fetched (${dropClassPrefix(err instanceof Error ? err.message : String(err))}). The filing row below is still correct; retry the text with edgar_filing_text({accession:"${only.accession_number}", ticker_or_cik:"${tickerOrCik}"}).`;
+      }
+    } else {
+      primaryTextNote = `include_primary_text was requested but ${filings.length} filings match, and this tool returns the text of ONE filing only. Pass \`accession\` (or a narrower \`filed\`) to pick one, or call edgar_filing_text for a filing's full, pageable text.`;
+    }
+  }
 
   return {
     cik: data.cik,
@@ -2327,7 +2523,18 @@ async function companyFilings(tickerOrCik: string, formType?: string, limit?: nu
     state_of_incorporation: data.stateOfIncorporation,
     fiscal_year_end: data.fiscalYearEnd,
     filter_form_type: formType ?? 'all',
+    ...(wantAcc ? { filter_accession: wantAcc.dashed } : {}),
+    ...(filedPrefix ? { filter_filed: filedPrefix } : {}),
+    // Narrowing is stated, so a one-row answer never reads as "this company
+    // has filed exactly one thing".
+    ...(wantAcc || filedPrefix
+      ? {
+          narrowed_note: `This is NOT ${data.name}'s recent filings list — it was narrowed to ${wantAcc ? `the single filing ${wantAcc.dashed}` : `filings dated ${filedPrefix}`}, ${filings.length} of ${totalBeforeNarrowing} candidate(s) examined. Drop that argument for the full list.`,
+        }
+      : {}),
     filings,
+    ...(primaryText !== null ? { primary_text: primaryText } : {}),
+    ...(primaryTextNote ? { primary_text_note: primaryTextNote } : {}),
   };
 }
 
@@ -2553,11 +2760,117 @@ function findLatestFormIndex(forms: string[], wantFormTypeArg: string | undefine
   return forms.findIndex((f) => wanted.includes(f.toUpperCase()));
 }
 
+/**
+ * Normalise a caller's `filed` into a date PREFIX we can match against SEC's
+ * own `filingDate` strings ("2026-09-29"). Accepts a full ISO date, a month
+ * ("2026-09"), a year ("2026"), and the US spellings a model actually types
+ * ("09/29/2026", "September 29 2026"). Returns null when nothing date-shaped
+ * is in there, which is treated as "no date filter" rather than an error — a
+ * wrong-shaped date that silently matched nothing would be the same class of
+ * defect this whole change exists to remove.
+ */
+// Full names AND the abbreviations in actual use, listed rather than matched by
+// prefix: a 3-letter prefix accepts "Septober" as September, which is the
+// silent-wrong-answer shape this whole change is about. An unrecognised month
+// returns null and the caller gets an explicit error.
+const FILED_MONTHS: Record<string, string> = {
+  january: '01', jan: '01',
+  february: '02', feb: '02',
+  march: '03', mar: '03',
+  april: '04', apr: '04',
+  may: '05',
+  june: '06', jun: '06',
+  july: '07', jul: '07',
+  august: '08', aug: '08',
+  september: '09', sept: '09', sep: '09',
+  october: '10', oct: '10',
+  november: '11', nov: '11',
+  december: '12', dec: '12',
+};
+export function normalizeFiledPrefix(filed: string | undefined): string | null {
+  const s = (filed ?? '').trim();
+  if (!s) return null;
+  let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = /^(\d{4})-(\d{2})$/.exec(s);
+  if (m) return `${m[1]}-${m[2]}`;
+  m = /^(\d{4})$/.exec(s);
+  if (m) return m[1];
+  m = /^(\d{1,2})[/.](\d{1,2})[/.](\d{4})$/.exec(s); // 09/29/2026 (US order)
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  // "September 29, 2026" / "Sept 29 2026" / "September 2026"
+  const words = /^([A-Za-z]{3,9})\.?\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(\d{4})$/.exec(s);
+  if (words) {
+    const mo = FILED_MONTHS[words[1].toLowerCase()];
+    if (mo) return words[2] ? `${words[3]}-${mo}-${words[2].padStart(2, '0')}` : `${words[3]}-${mo}`;
+  }
+  return null;
+}
+
+/**
+ * Recent-index positions of EVERY filing matching `wantFormTypeArg`, newest
+ * first, optionally restricted to those whose filingDate starts with
+ * `filedPrefix`. `findLatestFormIndex` above answers "which one filing", which
+ * is all the auto-resolve path used to need; this answers "which filings could
+ * the caller have meant", which is what lets the tool (a) honour a date in the
+ * question and (b) say out loud that it picked one of several.
+ */
+export function findFormIndices(
+  forms: string[],
+  wantFormTypeArg: string | undefined,
+  filingDates: string[],
+  filedPrefix: string | null,
+  limit: number,
+): number[] {
+  const wanted = (wantFormTypeArg ?? '')
+    .split('|')
+    .map((f) => f.trim().toUpperCase())
+    .filter(Boolean);
+  const out: number[] = [];
+  for (let i = 0; i < forms.length && out.length < limit; i++) {
+    if (wanted.length && !wanted.includes((forms[i] ?? '').toUpperCase())) continue;
+    if (filedPrefix && !(filingDates[i] ?? '').startsWith(filedPrefix)) continue;
+    out.push(i);
+  }
+  return out;
+}
+
+// How many auto-selected candidates this tool will READ when a `search` can
+// tell a silent filing apart from the right one, and how many it will LIST in
+// the envelope either way. Reading is bounded because each candidate is a real
+// SEC document fetch; listing is free (it comes out of the submissions payload
+// already in hand).
+const AUTO_SELECT_SCAN = 4;
+const AUTO_SELECT_LIST = 8;
+
+/**
+ * The `section` slice of a filing's text, as a function rather than inline, so
+ * the auto-selection walk below can score a candidate against the SAME text
+ * the search will actually run on. `section` is best-effort: an unmatched
+ * section returns the whole document with section_found:false, unchanged.
+ */
+export function sliceFilingSection(
+  fullText: string,
+  section: string | undefined,
+): { text: string; applied: string | null; found: string | boolean | null } {
+  const sec = (section ?? '').trim().toLowerCase();
+  if (!sec) return { text: fullText, applied: null, found: null };
+  const conf = FILING_SECTION_PATTERNS[sec];
+  if (!conf) return { text: fullText, applied: null, found: `unknown_section:${sec}` };
+  const idxs: number[] = [];
+  for (const m of fullText.matchAll(conf.anchor)) if (m.index !== undefined) idxs.push(m.index);
+  const chosen = idxs.length === 0 ? -1 : conf.pick === 'first' ? idxs[0] : idxs[idxs.length - 1];
+  if (chosen < 0) return { text: fullText, applied: null, found: false };
+  // Back up a little so the section heading itself is included, not clipped mid-phrase.
+  return { text: fullText.slice(Math.max(0, chosen - 120)), applied: sec, found: true };
+}
+
 async function filingDocuments(
   accession: string | undefined,
   tickerOrCik: string,
   includePrimaryText?: boolean,
   wantFormTypeArg?: string,
+  filedArg?: string,
 ) {
   if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
     throw new Error(
@@ -2575,22 +2888,48 @@ async function filingDocuments(
       `Invalid accession "${accession}". A SEC accession number is 18 digits shaped 10-2-6 (e.g. "0000320193-25-000079", with or without dashes). Get accession numbers from edgar_company_filings, or omit accession and pass form_type to auto-resolve the latest.`,
     );
   }
+  // ── WHEN WE CHOSE THE FILING, SAY SO (fleet #3319) ───────────────────────
+  // Same defect and same disclosure as edgar_filing_text: with `accession`
+  // omitted this resolves the LATEST filing of form_type and then describes it
+  // as though the caller had asked for it. There is no `search` here to tell
+  // candidates apart, so the newest is still taken — but the choice, and the
+  // filings not chosen, are now stated rather than invisible.
+  let autoSelected: Record<string, unknown> | null = null;
   if (!acc) {
     const wantForm = wantFormTypeArg?.trim().toUpperCase();
+    const filedPrefix = normalizeFiledPrefix(filedArg);
+    if (filedArg && !filedPrefix) {
+      throw new Error(`Could not read "${filedArg}" as a filing date. Pass an ISO date, month or year — "2026-09-29", "2026-09", "2026" — or the US spellings "09/29/2026" / "September 29, 2026".`);
+    }
     const subRes = await pwFetch(`${DATA_BASE}/submissions/CIK${padCik(cik)}.json`, { headers: SEC_HEADERS });
     if (!subRes.ok) throw new Error(`SEC submissions lookup failed (HTTP ${subRes.status}) resolving the latest filing for ${tickerOrCik}.`);
-    const sub = (await subRes.json()) as { filings?: { recent?: { accessionNumber?: string[]; form?: string[] } } };
+    const sub = (await subRes.json()) as { filings?: { recent?: { accessionNumber?: string[]; form?: string[]; filingDate?: string[] } } };
     const r = sub.filings?.recent;
     const forms = r?.form ?? [];
     const accs = r?.accessionNumber ?? [];
-    const idx = findLatestFormIndex(forms, wantFormTypeArg);
-    if (idx < 0 || !accs[idx]) {
+    const dates = r?.filingDate ?? [];
+    const candidateIdx = findFormIndices(forms, wantFormTypeArg, dates, filedPrefix, AUTO_SELECT_LIST)
+      .filter((i) => !!accs[i] && !!normalizeAccession(accs[i]));
+    if (!candidateIdx.length) {
+      const dateClause = filedPrefix ? ` dated ${filedPrefix}` : '';
       throw new Error(
-        `No ${wantForm ?? 'recent'} filing found for ${tickerOrCik} in the recent index. Use edgar_company_filings({ticker:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list available filings, then pass an accession.`,
+        `No ${wantForm ?? 'recent'} filing${dateClause} found for ${tickerOrCik} in the recent index. Use edgar_company_filings({ticker:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list available filings, then pass an accession.`,
       );
     }
-    acc = normalizeAccession(accs[idx]);
+    const chosenIdx = candidateIdx[0];
+    acc = normalizeAccession(accs[chosenIdx]);
     if (!acc) throw new Error('Failed to resolve a valid accession from the submissions index.');
+    autoSelected = {
+      reason: `No accession was given, so this tool CHOSE the filing below — ${filedPrefix ? `the newest ${wantForm ?? 'filing'} dated ${filedPrefix}` : wantForm ? `the newest ${wantForm}` : 'the single most recent filing of ANY type'}.`,
+      requested: { form_type: wantForm ?? null, filed: filedPrefix ?? null },
+      chosen: { accession: acc.dashed, form: forms[chosenIdx] ?? null, filed: dates[chosenIdx] ?? null },
+      candidates: candidateIdx.map((i) => ({
+        accession: normalizeAccession(accs[i])!.dashed,
+        form: forms[i] ?? null,
+        filed: dates[i] ?? null,
+      })),
+      note: `If the question named a particular filing, pass its \`accession\` (or \`filed\`: "${dates[chosenIdx] ?? '2026-09-29'}") rather than relying on this choice — a company files many ${wantForm ?? 'document'}s and the newest is routinely not the one asked about.`,
+    };
   }
   const cikNoZeros = String(Number(cik.replace(/\D/g, ''))); // archive path uses CIK with no leading zeros
   const paddedCik = padCik(cik);
@@ -2660,6 +2999,10 @@ async function filingDocuments(
     company,
     form_type: formType,
     filing_date: filingDate,
+    // Whether the caller NAMED this filing or we picked it (fleet #3319).
+    // Present on every response so its absence is never the signal.
+    accession_source: autoSelected ? 'auto_selected' : 'caller',
+    ...(autoSelected ? { auto_selected: autoSelected } : {}),
     primary_document: primaryDocument,
     filing_url: `${folder}/${acc.dashed}-index.html`,
     documents,
@@ -2846,6 +3189,7 @@ async function filingText(
   offset?: number,
   wantFormTypeArg?: string,
   searchTerm?: string,
+  filedArg?: string,
 ) {
   if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
     throw new Error('A company is required: pass `ticker` ("ACTU"), `cik` or their alias `ticker_or_cik` — plus either an accession or a form_type (e.g. edgar_filing_text({ticker:"ACTU", form_type:"10-Q"})).');
@@ -2869,83 +3213,175 @@ async function filingText(
   const r = sub.filings?.recent;
   const accs = r?.accessionNumber ?? [];
   const forms = r?.form ?? [];
+  const filingDates = r?.filingDate ?? [];
 
-  if (!acc) {
-    const wantForm = wantFormTypeArg?.trim().toUpperCase();
-    const idx = findLatestFormIndex(forms, wantFormTypeArg);
-    if (idx < 0 || !accs[idx]) {
-      throw new Error(`No ${wantForm ?? 'recent'} filing found for ${tickerOrCik}. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list filings, then pass an accession.`);
+  // `searchPhrases` is parsed up here, rather than beside its use further down,
+  // because the auto-selection walk below needs to know whether there is a
+  // phrase that can distinguish "this is the filing the caller meant" from
+  // "this filing does not mention the subject at all".
+  //
+  // fleet #2450: a question can ask for TWO facts from the SAME filing
+  // ("revenue AND test volume") and ask_pipeworx's router picks ONE tool call
+  // for a single-entity question — so a single `search` phrase per call meant
+  // the second fact was structurally unreachable. `search` accepts multiple
+  // phrases separated by `|` (same convention as `form_type`'s "10-K|10-Q"
+  // set) and reports each phrase's passages independently under `searches`,
+  // keyed by `phrase`. A single phrase (no `|`) keeps the original singular
+  // `search` shape unchanged.
+  const searchPhrases = [...new Set(
+    (searchTerm ?? '').split('|').map((p) => p.trim()).filter(Boolean),
+  )].slice(0, 5);
+
+  // Everything downstream that depends on WHICH filing this is, as one step,
+  // so the walk below can evaluate more than one candidate.
+  const loadFiling = async (chosen: { dashed: string; nodash: string }) => {
+    const i = accs.indexOf(chosen.dashed);
+    const form = i >= 0 ? forms[i] ?? null : null;
+    const filedOn = i >= 0 ? filingDates[i] ?? null : null;
+    let primaryDoc = i >= 0 ? r?.primaryDocument?.[i] ?? null : null;
+
+    const folder = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${chosen.nodash}`;
+    // If the accession wasn't in the recent index (older filing), fall back to the
+    // folder index to find the primary document.
+    if (!primaryDoc) {
+      const idxRes = await pwFetch(`${folder}/index.json`, { headers: SEC_HEADERS });
+      if (idxRes.status === 404) throw new Error(`No filing found for accession ${chosen.dashed} — it does not exist in SEC EDGAR for this filer. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"}) to list real accessions.`);
+      if (!idxRes.ok) throw await httpError(idxRes, 'SEC EDGAR filing index error');
+      const idxJson = (await idxRes.json()) as { directory?: { item?: { name: string; type?: string }[] } };
+      const docs = idxJson.directory?.item ?? [];
+      // Prefer the main htm document that isn't an exhibit/XBRL artifact.
+      primaryDoc =
+        docs.find((d) => /\.htm/i.test(d.name) && !/^R\d|_cal|_def|_lab|_pre|_htm\.xml|-index/i.test(d.name))?.name ?? null;
+      if (!primaryDoc) throw new Error(`Could not identify the primary document for accession ${chosen.dashed}. Use edgar_filing_documents to list the filing's files and fetch one by URL.`);
     }
-    acc = normalizeAccession(accs[idx]);
-    if (!acc) throw new Error('Failed to resolve a valid accession from the submissions index.');
+
+    const url = `${folder}/${primaryDoc}`;
+    const { text: raw, truncated: rawTrunc } = await fetchTextBounded(url, { 'User-Agent': SEC_HEADERS['User-Agent'] }, FILING_DOC_MAX_BYTES);
+    const html = /\.x?html?$/i.test(primaryDoc) || /^\s*</.test(raw);
+    return {
+      acc: chosen,
+      formType: form,
+      filingDate: filedOn,
+      primaryDocument: primaryDoc,
+      docUrl: url,
+      rawTruncated: rawTrunc,
+      fullText: html ? htmlToText(raw) : raw,
+    };
+  };
+
+  // ── WHEN WE CHOSE THE FILING, SAY SO (fleet #3319) ───────────────────────
+  //
+  // With `accession` omitted this tool resolves the LATEST filing of
+  // `form_type` — and then every field in the response describes that filing
+  // as though the caller had asked for it. Measured live 2026-10-18: a
+  // grounded question about "Tesla's September 29 2026 8-K" reached here as
+  // {ticker:"TSLA", form_type:"8-K", search:"credit facility"}, resolved to
+  // the 2026-10-02 8-K (a different filing, 3,061 chars, zero matches), and
+  // refused `not_in_source` 5 tries out of 5 — while the filing asked about
+  // sat two rows down the same index with all three figures in it. Nothing in
+  // the envelope could tell a reader that a choice had been made at all, so
+  // "wrong filing" and "filing is silent on this" were indistinguishable.
+  //
+  // Two changes, both narrow: a `filed` date goes straight to the right
+  // filing, and when only a `search` is available the walk below reads on past
+  // a candidate whose text does not contain the phrase AT ALL. Either way the
+  // choice, and the candidates not chosen, are stated in `auto_selected`.
+  let loaded: Awaited<ReturnType<typeof loadFiling>>;
+  let autoSelected: Record<string, unknown> | null = null;
+
+  if (acc) {
+    loaded = await loadFiling(acc);
+  } else {
+    const wantForm = wantFormTypeArg?.trim().toUpperCase();
+    const filedPrefix = normalizeFiledPrefix(filedArg);
+    if (filedArg && !filedPrefix) {
+      throw new Error(`Could not read "${filedArg}" as a filing date. Pass an ISO date, month or year — "2026-09-29", "2026-09", "2026" — or the US spellings "09/29/2026" / "September 29, 2026".`);
+    }
+    const candidateIdx = findFormIndices(forms, wantFormTypeArg, filingDates, filedPrefix, AUTO_SELECT_LIST)
+      .filter((idx) => !!accs[idx] && !!normalizeAccession(accs[idx]));
+    if (!candidateIdx.length) {
+      const dateClause = filedPrefix ? ` dated ${filedPrefix}` : '';
+      throw new Error(`No ${wantForm ?? 'recent'} filing${dateClause} found for ${tickerOrCik}. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list filings, then pass an accession.`);
+    }
+
+    const candidates = candidateIdx.map((idx) => ({
+      accession: normalizeAccession(accs[idx])!.dashed,
+      form: forms[idx] ?? null,
+      filed: filingDates[idx] ?? null,
+    }));
+
+    // Reading past the first candidate is only useful when a `search` can
+    // score one — with no phrase there is nothing to tell the candidates
+    // apart, so the newest is taken exactly as before. EXACT matches only:
+    // the word-level fallback is "a lead, not a confirmation" by this tool's
+    // own note, and scoring on it would stop the walk at a filing that merely
+    // shares vocabulary.
+    const walk = searchPhrases.length ? candidateIdx.slice(0, AUTO_SELECT_SCAN) : candidateIdx.slice(0, 1);
+    const examined: Array<{ accession: string; form: string | null; filed: string | null; exact_matches?: number }> = [];
+    let picked: Awaited<ReturnType<typeof loadFiling>> | null = null;
+    let fallback: Awaited<ReturnType<typeof loadFiling>> | null = null;
+    for (const idx of walk) {
+      const cand = await loadFiling(normalizeAccession(accs[idx])!);
+      const scoreText = sliceFilingSection(cand.fullText, section).text;
+      const matches = searchPhrases.reduce((n, p) => n + findPassages(scoreText, p).total, 0);
+      examined.push({
+        accession: cand.acc.dashed,
+        form: cand.formType,
+        filed: cand.filingDate,
+        ...(searchPhrases.length ? { exact_matches: matches } : {}),
+      });
+      fallback ??= cand; // the newest — the historical choice, and the fallback
+      if (!searchPhrases.length || matches > 0) {
+        picked = cand;
+        break;
+      }
+    }
+    loaded = picked ?? fallback!;
+    const walkedOn = examined.length > 1 && picked !== null;
+    const allSilent = searchPhrases.length > 0 && picked === null;
+
+    autoSelected = {
+      // The one sentence a reader needs: nobody asked for THIS filing.
+      reason: `No accession was given, so this tool CHOSE the filing below — ${filedPrefix ? `the newest ${wantForm ?? 'filing'} dated ${filedPrefix}` : wantForm ? `the newest ${wantForm}` : 'the single most recent filing of ANY type'}${walkedOn ? ', after the newer candidate(s) in `examined` contained no exact match for the search phrase(s)' : ''}${allSilent ? ', and NONE of the candidates examined contained an exact match for the search phrase(s) — this is the newest one, not a filing shown to be relevant' : ''}.`,
+      requested: { form_type: wantForm ?? null, filed: filedPrefix ?? null },
+      chosen: { accession: loaded.acc.dashed, form: loaded.formType, filed: loaded.filingDate },
+      examined,
+      // Everything the caller might have meant, whether or not it was read —
+      // free, since it comes out of the submissions payload already in hand.
+      candidates,
+      note: `If the question named a particular filing, pass its \`accession\` (or \`filed\`: "${loaded.filingDate ?? '2026-09-29'}") rather than relying on this choice — a company files many ${wantForm ?? 'documents'}s and the newest is routinely not the one asked about.`,
+      ...(allSilent
+        ? {
+            warning: `Treat a zero-match result here as INCONCLUSIVE about the company, not about this filing: ${examined.length} candidate filing(s) were read and none mentions the search phrase(s). The filing the question meant may be one of \`candidates\` that was not read.`,
+          }
+        : {}),
+    };
   }
 
-  const i = accs.indexOf(acc.dashed);
-  const formType = i >= 0 ? forms[i] ?? null : null;
-  const filingDate = i >= 0 ? r?.filingDate?.[i] ?? null : null;
-  let primaryDocument = i >= 0 ? r?.primaryDocument?.[i] ?? null : null;
-
-  const folder = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${acc.nodash}`;
-  // If the accession wasn't in the recent index (older filing), fall back to the
-  // folder index to find the primary document.
-  if (!primaryDocument) {
-    const idxRes = await pwFetch(`${folder}/index.json`, { headers: SEC_HEADERS });
-    if (idxRes.status === 404) throw new Error(`No filing found for accession ${acc.dashed} — it does not exist in SEC EDGAR for this filer. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"}) to list real accessions.`);
-    if (!idxRes.ok) throw await httpError(idxRes, 'SEC EDGAR filing index error');
-    const idxJson = (await idxRes.json()) as { directory?: { item?: { name: string; type?: string }[] } };
-    const docs = idxJson.directory?.item ?? [];
-    // Prefer the main htm document that isn't an exhibit/XBRL artifact.
-    primaryDocument =
-      docs.find((d) => /\.htm/i.test(d.name) && !/^R\d|_cal|_def|_lab|_pre|_htm\.xml|-index/i.test(d.name))?.name ?? null;
-    if (!primaryDocument) throw new Error(`Could not identify the primary document for accession ${acc.dashed}. Use edgar_filing_documents to list the filing's files and fetch one by URL.`);
-  }
-
-  const docUrl = `${folder}/${primaryDocument}`;
-  const { text: body, truncated: rawTruncated } = await fetchTextBounded(docUrl, { 'User-Agent': SEC_HEADERS['User-Agent'] }, FILING_DOC_MAX_BYTES);
-  const isHtml = /\.x?html?$/i.test(primaryDocument) || /^\s*</.test(body);
-  let fullText = isHtml ? htmlToText(body) : body;
+  acc = loaded.acc;
+  const { formType, filingDate, primaryDocument, docUrl, rawTruncated } = loaded;
+  let fullText = loaded.fullText;
+  // Held before any narrowing below, because `total_chars` is reframed by a
+  // section slice and then describes the SLICE — which is what this tool's own
+  // offsets page against, so it cannot also carry the document's size. Without
+  // this, a section slice and a search both shrink what we return while every
+  // number in the response still says "whole document" (fleet #3316).
+  const documentChars = fullText.length;
 
   // Optional section slice: locate the section heading (last occurrence = the
   // real body, past any table-of-contents mention) and reframe the text to start
   // there. `section` is best-effort — an unmatched section returns the whole doc.
-  let sectionApplied: string | null = null;
-  let sectionFound: string | boolean | null = null;
-  const sec = (section ?? '').trim().toLowerCase();
-  if (sec) {
-    const conf = FILING_SECTION_PATTERNS[sec];
-    if (!conf) {
-      sectionFound = `unknown_section:${sec}`;
-    } else {
-      const idxs: number[] = [];
-      for (const m of fullText.matchAll(conf.anchor)) if (m.index !== undefined) idxs.push(m.index);
-      const chosen = idxs.length === 0 ? -1 : conf.pick === 'first' ? idxs[0] : idxs[idxs.length - 1];
-      if (chosen >= 0) {
-        // Back up a little so the section heading itself is included, not clipped mid-phrase.
-        fullText = fullText.slice(Math.max(0, chosen - 120));
-        sectionApplied = sec;
-        sectionFound = true;
-      } else {
-        sectionFound = false;
-      }
-    }
-  }
+  const sliced = sliceFilingSection(fullText, section);
+  fullText = sliced.text;
+  const sectionApplied = sliced.applied;
+  const sectionFound = sliced.found;
 
   // `search` short-circuits the normal offset/max_chars windowing: it scans
   // the whole (possibly section-sliced) document and returns matching
   // passages with their own offsets, rather than one page of raw text the
   // caller has to eyeball for the fact they wanted (fleet #2446).
   //
-  // fleet #2450: a question can ask for TWO facts from the SAME filing
-  // ("revenue AND test volume") and ask_pipeworx's router picks ONE tool call
-  // for a single-entity question — so a single `search` phrase per call meant
-  // the second fact was structurally unreachable. `search` now accepts
-  // multiple phrases separated by `|` (same convention as `form_type`'s
-  // "10-K|10-Q" set) and reports each phrase's passages independently under
-  // `searches`, keyed by `phrase`. A single phrase (no `|`) keeps the original
-  // singular `search` shape unchanged.
-  const searchPhrases = [...new Set(
-    (searchTerm ?? '').split('|').map((p) => p.trim()).filter(Boolean),
-  )].slice(0, 5);
+  // (`searchPhrases` is parsed near the top — the auto-selection walk needs it.)
   if (searchPhrases.length > 0) {
     const buildOne = async (term: string) => {
       const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, term);
@@ -2989,17 +3425,56 @@ async function filingText(
 
     const results = await Promise.all(searchPhrases.map(buildOne));
 
+    // ── HOW MUCH OF THE DOCUMENT THIS RESPONSE ACTUALLY CARRIES (fleet #3316) ──
+    //
+    // A `search` returns matched passages INSTEAD of the text, and before this
+    // every size field in the envelope described the document rather than the
+    // answer: `total_chars: 9859` for a response holding 3,080 chars of it.
+    // The one field that looked like a loss signal, `search.truncated`, is
+    // about the SEARCH — false means "every distinct match location is here" —
+    // so a reader checking for loss found a field saying there was none.
+    //
+    // That is not merely untidy. ask_pipeworx_grounded sizes its own
+    // truncation by what it RECEIVES, so a narrowed payload fit its budget
+    // whole and was reported to the extraction model as complete: measured
+    // live 2026-10-18, 5 of 8 tries of "what credit facilities did Tesla enter
+    // into" answered with a WRONG total at confidence 0.4-0.6 and no refusal,
+    // off exactly this response shape.
+    //
+    // `returned_chars` / `truncated` therefore mean the same thing here as in
+    // the paged branch below — how much came back, and whether that is all of
+    // it. `next_offset` stays ABSENT: there is no page forward from a set of
+    // passages, and the way to read more is a follow-up call at a passage's
+    // own `offset`. Absent is a different fact from null and says so.
+    const returnedChars = results.reduce(
+      (n, r) => n + r.passages.reduce((m, psg) => m + psg.text.length, 0),
+      0,
+    );
+    const searchTruncated = returnedChars < documentChars;
+
     return {
       accession: acc.dashed,
       cik: cikNoZeros,
       company: sub.name ?? null,
       form: formType,
       filed: filingDate,
+      // Whether the caller NAMED this filing or we picked it (fleet #3319).
+      // Present on every response so its absence is never the signal.
+      accession_source: autoSelected ? ('auto_selected' as const) : ('caller' as const),
+      ...(autoSelected ? { auto_selected: autoSelected } : {}),
       document: primaryDocument,
       document_url: docUrl,
       section: sectionApplied,
       ...(sectionFound !== null ? { section_found: sectionFound } : {}),
       total_chars: fullText.length,
+      ...(fullText.length !== documentChars ? { document_chars: documentChars } : {}),
+      returned_chars: returnedChars,
+      truncated: searchTruncated,
+      ...(searchTruncated
+        ? {
+            truncated_note: `These are matched passages, not the document: ${returnedChars} of ${documentChars} characters. Anything the phrase(s) did not match is NOT in this response — do not read a figure's absence here as absence from the filing. Call again without \`search\` (or with a passage's \`offset\`) to read the surrounding text.`,
+          }
+        : {}),
       ...(searchPhrases.length === 1
         ? { search: results[0] }
         : {
@@ -3028,11 +3503,16 @@ async function filingText(
     company: sub.name ?? null,
     form: formType,
     filed: filingDate,
+    accession_source: autoSelected ? ('auto_selected' as const) : ('caller' as const),
+    ...(autoSelected ? { auto_selected: autoSelected } : {}),
     document: primaryDocument,
     document_url: docUrl,
     section: sectionApplied,
     ...(sectionFound !== null ? { section_found: sectionFound } : {}),
     total_chars: total,
+    // A section slice reframed `total_chars` to the slice (fleet #3316): say so,
+    // or a 2,000-char section of a 400,000-char 10-K reads as a whole document.
+    ...(total !== documentChars ? { document_chars: documentChars } : {}),
     offset: off,
     returned_chars: slice.length,
     truncated,
@@ -5201,6 +5681,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         companyArg(args),
         args.form_type as string | undefined,
         args.limit as number | undefined,
+        args.accession as string | undefined,
+        args.include_primary_text as boolean | undefined,
+        (args.filed ?? args.filing_date ?? args.filed_date) as string | undefined,
       );
     case 'edgar_company_facts':
       return companyFacts(companyArg(args));
@@ -5245,6 +5728,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         (args.cik ?? args.ticker ?? args.ticker_or_cik) as string,
         args.include_primary_text as boolean | undefined,
         args.form_type as string | undefined,
+        (args.filed ?? args.filing_date ?? args.filed_date) as string | undefined,
       );
     case 'edgar_filing_text':
       return filingText(
@@ -5255,6 +5739,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.offset as number | undefined,
         args.form_type as string | undefined,
         (args.search ?? args.contains ?? args.find ?? args.phrase) as string | undefined,
+        (args.filed ?? args.filing_date ?? args.filed_date) as string | undefined,
       );
     case 'edgar_ticker_to_cik':
       return tickerToCik((args.ticker ?? args.ticker_or_cik ?? args.company) as string);
