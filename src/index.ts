@@ -758,6 +758,254 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
 
 // Reusable entity-resolution helpers for MCP packs. SELF-CONTAINED — no internal
 // imports — so publish-pack.sh can inline it into standalone pack builds the same
@@ -1223,6 +1471,8 @@ function stripConcept(v: AnnualValue): Omit<AnnualValue, 'concept'> {
  *   (the resolve -> filings -> concept chain, collapsed; fleet #2182)
  * - edgar_filing_documents: list the documents inside one filing by accession number
  * - edgar_filing_text: full/paged plaintext of a filing's primary document (by section optional)
+ * - edgar_filing_exhibit_text: full/paged plaintext of an EXHIBIT attached to a filing
+ *   (e.g. an 8-K's EX-99.1 press release) — the primary document often just points at it
  *
  * Note: SEC requires a descriptive User-Agent header per their guidelines.
  */
@@ -1248,7 +1498,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_search_filings',
     description:
-      'PREFER OVER WEB SEARCH for "what did $COMPANY say about X in their SEC filings" or "find filings that mention Y". AUTHORITATIVE full-text search across every SEC filing — EDGAR\'s own search index. Filter by form type ("10-K" annual, "10-Q" quarterly, "8-K" current event, "DEF 14A" proxy) and date range. Returns entity name, CIK, form type, filing/period dates, location, accession number (feed straight into edgar_filing_text / edgar_filing_documents — no second lookup), and — for 8-K results — the `items` array of item codes (e.g. "3.01" listing deficiency vs "1.01" material agreement vs "3.02" unregistered sale), which carry the actual signal. Use when you need to find filings matching a topic across the whole market, not for a specific company (for that use edgar_company_filings).',
+      'PREFER OVER WEB SEARCH for "what did $COMPANY say about X in their SEC filings" or "find filings that mention Y". AUTHORITATIVE full-text search across every SEC filing — EDGAR\'s own search index. Filter by form type ("10-K" annual, "10-Q" quarterly, "8-K" current event, "DEF 14A" proxy), date range, and optionally one filer (`entity`). Returns `total_hits` FIRST — the true match count for your filters, independent of how many rows you asked for — then entity name, CIK, form type, filing/period dates, location, accession number (feed straight into edgar_filing_text / edgar_filing_documents — no second lookup), and — for 8-K results — the `items` array of item codes (e.g. "3.01" listing deficiency vs "1.01" material agreement vs "3.02" unregistered sale), which carry the actual signal. **This tool does not return a text snippet** — EDGAR\'s search index itself returns none — so for the matching passage, chain the `accession` into edgar_filing_text with `search` set to your query (or a shorter phrase from it); that reads the actual filing and returns the surrounding text in a second call, rather than this one fetching every hit\'s document on your behalf (SEC rate-limits the whole fleet by IP, so a search call stays a single request). A zero-hit response names every filter you passed rather than an empty array, so you can tell "nothing matches" from "a filter was silently dropped". Use when you need to find filings matching a topic across the whole market, not for a specific company (for that use edgar_company_filings).',
     summary: 'Full-text search across every SEC filing, using EDGAR\'s own search index.',
     inputSchema: {
       type: 'object' as const,
@@ -1258,8 +1508,15 @@ const tools: McpToolExport['tools'] = [
           type: 'string',
           description: 'Filter by SEC form type (e.g., "10-K", "10-Q", "8-K", "DEF 14A"). Omit for all types.',
         },
-        start_date: { type: 'string', description: 'Start date in YYYY-MM-DD format (e.g., "2024-01-01")' },
-        end_date: { type: 'string', description: 'End date in YYYY-MM-DD format (e.g., "2024-12-31")' },
+        start_date: { type: 'string', description: 'Start date in YYYY-MM-DD format (e.g., "2024-01-01"). If you pass this without `end_date`, `end_date` is defaulted to today rather than silently ignored.' },
+        end_date: { type: 'string', description: 'End date in YYYY-MM-DD format (e.g., "2024-12-31"). If you pass this without `start_date`, `start_date` is defaulted to EDGAR full-text search\'s coverage floor (2001-01-01) rather than silently ignored.' },
+        entity: {
+          type: 'string',
+          description: 'Narrow results to ONE filer, by ticker ("AAPL"), company name ("Apple Inc."), or CIK ("320193") — omit to search across every filer. Aliases `ticker_or_cik` / `cik` / `ticker` are also accepted, the spellings this pack\'s other tools use for the same thing.',
+        },
+        ticker_or_cik: { type: 'string', description: 'Alias for `entity`.' },
+        cik: { type: 'string', description: 'Alias for `entity`.' },
+        ticker: { type: 'string', description: 'Alias for `entity`.' },
         limit: { type: 'number', description: 'Number of results to return (1-40, default 10)' },
       },
       required: ['query'],
@@ -1345,7 +1602,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_company_concept',
     description:
-      'AUTHORITATIVE historical financials for any US public company. Source: SEC XBRL filings (the official numbers companies file, not third-party scrapes). Send the company as `cik` — that argument takes a TICKER ("AAPL") or a CIK ("320193"), and `ticker` / `ticker_or_cik` are accepted as aliases for it — plus the metric as `concept` (alias `metric`), which takes a friendly name: Revenue, NetIncomeLoss, Cash, LongTermDebt, EarningsPerShareDiluted. The tool resolves the right XBRL tag for that filer (post-ASC-606 companies use RevenueFromContractWithCustomerExcludingAssessedTax instead of "Revenues", etc.). Returns both ANNUAL (10-K) and QUARTERLY (10-Q) values by default, each labeled with fiscal_period (FY/Q1/Q2/Q3/Q4) and form, newest first, PLUS a `latest` field holding the single freshest data point. Q4 rows are DERIVED (FY minus Q1-Q3, marked derived:true) because SEC filers never report a standalone Q4 fact — so "revenue Q4 2024" questions are answerable directly from `values`. For one specific period, pass `fiscal_year` and/or `fiscal_period` as ARGUMENTS and the values array comes back filtered to it (they are also the names of the fields on each returned row, which is what to match on if you ask for every period instead); do not default to `latest` for a period question. Use `latest` for point-in-time metrics like cash, runway, and debt — it is the newest 10-Q when one is more recent than the last 10-K, so a stale annual figure never masks a newer quarter. Use for "what was AAPL\'s revenue in 2024", "NVDA\'s latest cash position", "show me long-term debt trend", anything where you need the SEC-filed number rather than an estimate.',
+      'AUTHORITATIVE historical financials for any US public company. Source: SEC XBRL filings (the official numbers companies file, not third-party scrapes). Send the company as `cik` — that argument takes a TICKER ("AAPL") or a CIK ("320193"), and `ticker` / `ticker_or_cik` are accepted as aliases for it — plus the metric as `concept` (alias `metric`), which takes a friendly name: Revenue, NetIncomeLoss, Cash, LongTermDebt, EarningsPerShareDiluted. The tool resolves the right XBRL tag for that filer (post-ASC-606 companies use RevenueFromContractWithCustomerExcludingAssessedTax instead of "Revenues", etc.). Returns both ANNUAL (10-K) and QUARTERLY (10-Q) values by default, each labeled with fiscal_period and form, newest first, PLUS a `latest` field holding the single freshest data point. Every row also carries `period_start`/`period_end`/`duration_days` so the window a value covers is never ambiguous. Q4 rows are DERIVED (FY minus Q1-Q3, marked derived:true) because SEC filers never report a standalone Q4 fact — so "revenue Q4 2024" questions are answerable directly from `values`. CASH-FLOW-STATEMENT concepts (OperatingCashFlow, Capex and siblings) are filed CUMULATIVELY by most filers — a 10-Q\'s six-month figure is reported under the SAME period label the discrete quarter would use. Those rows are labeled `fiscal_period` "H1" (six months) or "9M" (nine months) with `ytd:true`, never "Q2"/"Q3" bare, and a discrete-quarter sibling (`derived:true`, e.g. Q2 = H1 minus Q1) is added alongside so "capex Q2" is still answerable without presenting the six-month total as a quarter. Income-statement lines (Revenue, NetIncomeLoss) are usually filed quarter-only already and are unaffected. For one specific period, pass `fiscal_year` and/or `fiscal_period` as ARGUMENTS and the values array comes back filtered to it (they are also the names of the fields on each returned row, which is what to match on if you ask for every period instead); do not default to `latest` for a period question. Use `latest` for point-in-time metrics like cash, runway, and debt — it is the newest 10-Q when one is more recent than the last 10-K, so a stale annual figure never masks a newer quarter; for a YTD-shaped concept, `latest` prefers the discrete derived quarter over the as-filed cumulative figure, so it is never silently a 2-3x-too-large number. Use for "what was AAPL\'s revenue in 2024", "NVDA\'s latest cash position", "show me long-term debt trend", anything where you need the SEC-filed number rather than an estimate.',
     summary: 'One financial metric for a US public company across every period it has reported, from SEC XBRL.',
     inputSchema: {
       type: 'object' as const,
@@ -1370,8 +1627,8 @@ const tools: McpToolExport['tools'] = [
         },
         fiscal_period: {
           type: 'string',
-          description: 'Optional filter: return only rows for this period within the fiscal year — "FY" (annual), "Q1", "Q2", "Q3", or "Q4" (derived: FY minus Q1-Q3). Combine with fiscal_year for a single figure.',
-          enum: ['FY', 'Q1', 'Q2', 'Q3', 'Q4'],
+          description: 'Optional filter: return only rows for this period within the fiscal year — "FY" (annual), "Q1", "Q2", "Q3", "Q4" (derived: FY minus Q1-Q3), "H1" (six-month year-to-date, cash-flow-statement concepts only), or "9M" (nine-month year-to-date). Combine with fiscal_year for a single figure. Asking for "Q2"/"Q3" on a concept this filer reports cumulatively returns the DERIVED discrete quarter, not the H1/9M total.',
+          enum: ['FY', 'Q1', 'Q2', 'Q3', 'Q4', 'H1', '9M'],
         },
         ticker: {
           type: 'string',
@@ -1773,6 +2030,62 @@ const tools: McpToolExport['tools'] = [
       required: [],
     },
   },
+  {
+    name: 'edgar_filing_exhibit_text',
+    description:
+      'Full text of an EXHIBIT attached to a filing — not the filing\'s own primary document (use edgar_filing_text for that). This is the only way to read an 8-K\'s Exhibit 99.1/99.2 press release — a quarterly production-and-delivery report, an earnings release, a KPI update — because the 8-K body itself routinely just says "see the attached exhibit" and carries none of the numbers; the figures live in the exhibit document. Pass the filer\'s `ticker` or `cik` plus either an `accession` (from edgar_company_filings) or a `form_type` to auto-resolve the latest matching filing (defaults to "8-K" when both accession and form_type are omitted, since that is overwhelmingly when an exhibit holds the operative content). Set `exhibit` to pick a specific attachment by its SEC-assigned type — "99.1", "99", "10.1" — read off the filing\'s own document index (case-insensitive, the "EX-" prefix optional); omit it to default to the first EX-99.* exhibit, which is the convention Item 2.02 (earnings) and Item 7.01 (Reg FD) 8-Ks use for a press release. When the requested exhibit is not found (or none exists), the response lists every exhibit actually in the filing under `available_exhibits` rather than failing silently. **For a specific number inside the exhibit, pass `search`** (a short phrase likely to appear verbatim, e.g. "vehicle deliveries", "Megapack", "energy storage") the same way edgar_filing_text does — it scans the whole exhibit and returns matching passages ranked by a nearby figure, with `|`-separated phrases for more than one fact in one call; a zero-match search is a real answer (try different wording) and falls back to a word-level match when the exact phrase misses. Without `search`, the exhibit text is returned paged (`max_chars`/`offset`, same convention as edgar_filing_text) since a press release can run several thousand words. Use for "Tesla\'s Q3 2026 vehicle deliveries and production", "what did $TICKER\'s earnings press release say about [KPI]", "read the exhibit attached to $TICKER\'s latest 8-K". Source: U.S. Securities and Exchange Commission, EDGAR filing exhibits (the same primary-source filings edgar_filing_text and edgar_filing_documents read).',
+    summary: 'Full text of an exhibit (e.g. a press release) attached to an SEC filing, such as an 8-K\'s EX-99.1.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        ticker: {
+          type: 'string',
+          description: 'The filer\'s ticker (e.g. "TSLA") or company name. Provide this OR cik. Tickers are auto-resolved to CIKs.',
+        },
+        cik: {
+          type: 'string',
+          description: 'The filer\'s CIK number (e.g. "1318605"). Provide this OR ticker.',
+        },
+        ticker_or_cik: {
+          type: 'string',
+          description: 'Alias for `ticker` / `cik` — the single-argument spelling edgar_filing_documents and edgar_filing_text use. Takes either a ticker or a CIK.',
+        },
+        accession: {
+          type: 'string',
+          description: 'Optional SEC accession number of a specific filing, with or without dashes (e.g. "0001628280-26-064366"). Omit it to auto-resolve the latest filing matching form_type (and filed, if given) — the response says `accession_source:"auto_selected"` when this happens.',
+        },
+        form_type: {
+          type: 'string',
+          description: 'When accession is omitted, the form type of the filing to resolve — "8-K", "10-K", "10-Q", etc., or a `|`-separated set. Defaults to "8-K" when both accession and form_type are omitted, since an exhibit holding the operative content (a press release) is overwhelmingly an 8-K attachment.',
+        },
+        filed: {
+          type: 'string',
+          description: 'Only consider filings filed on this date, in this month, or in this year — "2026-10-02", "2026-10", "2026" (US spellings accepted). Pass this whenever the question names a date or quarter ("Tesla\'s Q3 2026 deliveries report") — Tesla and most large filers submit TWO 8-Ks a quarter (a day-2 production-and-delivery release, then a day-~22 full earnings release), so without a date the newest one is used and it may not be the one the question means.',
+        },
+        filing_date: { type: 'string', description: 'Alias for `filed`.' },
+        exhibit: {
+          type: 'string',
+          description: 'Which exhibit to read, by its SEC-assigned type — "99.1", "EX-99.1", "99", "10.1" (case-insensitive, "EX-" prefix optional). Omit to default to the first EX-99.* exhibit (the press-release convention). If nothing matches, the response lists every exhibit the filing actually has under `available_exhibits` instead of failing with no leads.',
+        },
+        search: {
+          type: 'string',
+          description: 'Find a specific fact instead of paging blind — same convention as edgar_filing_text\'s `search`. A short 2-4 word phrase likely to appear VERBATIM (e.g. "vehicle deliveries", "energy storage deployments"), case-insensitive, scanned over the WHOLE exhibit text before any paging. Falls back to a word-level match (reported as such) when the exact phrase has no match. Separate multiple facts with `|` (e.g. "vehicle deliveries|energy storage deployments") to get both from this one exhibit in one call, each reported independently under `searches[]`.',
+        },
+        contains: { type: 'string', description: 'Alias for `search`.' },
+        find: { type: 'string', description: 'Alias for `search`.' },
+        phrase: { type: 'string', description: 'Alias for `search`.' },
+        max_chars: {
+          type: 'number',
+          description: 'Max characters to return in this page when `search` is not used (1000–100000, default 50000). Text past this is available via next_offset.',
+        },
+        offset: {
+          type: 'number',
+          description: 'Character offset to start from when `search` is not used (default 0). Pass the prior result\'s next_offset to page forward.',
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1787,21 +2100,93 @@ function isNumericCik(value: string): boolean {
 
 // ── Tool implementations ────────────────────────────────────────────
 
+// efts.sec.gov sits behind an API Gateway response cache keyed on q, the date
+// window, forms and from/page — but NOT on ciks/sics/entityName (measured
+// 2026-08-28, fleet #619: a ciks-filtered request was served the unfiltered
+// 10,000-hit result cached seconds earlier for the same q+dates, and the
+// reverse leak too). Fix proven live in mcps/sec-contracts: append a negated
+// nonsense token derived from the filter to `q`; efts compiles it to a
+// must_not match_phrase that matches no document (totals verified identical
+// with/without it), which makes the cache key unique per filter set.
+function eftsCikCacheKeyToken(paddedCik: string): string {
+  return 'zqfc' + paddedCik.replace(/\D/g, '');
+}
+
+// EDGAR full-text search's own coverage floor — a startdt before this is
+// clamped by EFTS itself, so defaulting a missing end date there is honest
+// rather than arbitrary.
+const EFTS_FLOOR = '2001-01-01';
+
 async function searchFilings(
   query: string,
   formType?: string,
   startDate?: string,
   endDate?: string,
   limit?: number,
+  entity?: string,
 ) {
   const count = Math.min(40, Math.max(1, limit ?? 10));
   const params = new URLSearchParams({ q: query, from: '0', size: String(count) });
 
   if (formType) params.set('forms', formType);
+  // efts silently IGNORES dateRange=custom when only one of startdt/enddt is
+  // given (the filter array comes back empty and every year's hits appear) —
+  // reference_efts_cache_key_leak, fleet #619. Always send both ends once
+  // either is requested, defaulting the missing one rather than dropping the
+  // filter the caller asked for.
+  let effStart = startDate;
+  let effEnd = endDate;
   if (startDate || endDate) {
+    effStart = startDate ?? EFTS_FLOOR;
+    effEnd = endDate ?? new Date().toISOString().slice(0, 10);
     params.set('dateRange', 'custom');
-    if (startDate) params.set('startdt', startDate);
-    if (endDate) params.set('enddt', endDate);
+    params.set('startdt', effStart);
+    params.set('enddt', effEnd);
+  }
+
+  // Resolve an optional entity filter to a CIK. Numeric input is taken as a
+  // CIK directly; otherwise try the ticker/name resolver, and for a delisted
+  // or never-listed filer (not in company_tickers.json) fall back to EDGAR's
+  // own entity-typeahead the same way edgar_ticker_to_cik does.
+  let entityFilter: { cik: string; cik_padded: string; company_name?: string; ticker?: string | null; matched_by: string } | undefined;
+  let entityFilterError: string | undefined;
+  if (entity && String(entity).trim()) {
+    const raw = String(entity).trim();
+    try {
+      if (/^\d{1,10}$/.test(raw)) {
+        entityFilter = { cik: String(Number(raw)), cik_padded: raw.padStart(10, '0'), matched_by: 'cik' };
+      } else {
+        try {
+          const ent = await resolveSecEntity(raw, { headers: SEC_HEADERS });
+          entityFilter = { cik: ent.cik, cik_padded: ent.cik_padded, company_name: ent.company_name, ticker: ent.ticker, matched_by: ent.matched_by };
+        } catch (err) {
+          if (!/No SEC company matches/.test(String((err as Error)?.message))) throw err;
+          const match = await resolveAnyFilerByName(raw, err as Error);
+          entityFilter = { cik: match.cik, cik_padded: match.cik_padded, company_name: match.company_name, ticker: null, matched_by: match.matched_by };
+        }
+      }
+    } catch (err) {
+      // An entity filter that cannot be resolved at all is reported, not
+      // silently dropped — an unfiltered market-wide search under a caller's
+      // believed-narrowed request is a worse failure than an explicit error.
+      entityFilterError = (err as Error)?.message ?? String(err);
+    }
+  }
+  if (entityFilterError) {
+    return {
+      query,
+      entity_filter: entity,
+      entity_filter_error: entityFilterError,
+      total_hits: 0,
+      results: [],
+      no_match: `"${entity}" could not be resolved to a filer — no search was run. Filters tried: query="${query}", form_type=${formType ?? 'all'}, entity="${entity}" (unresolved), date_range=${effStart ?? 'none'}..${effEnd ?? 'none'}.`,
+    };
+  }
+  if (entityFilter) {
+    params.set('ciks', entityFilter.cik_padded);
+    // Cache-key fix (see header): append the negated token so this request's
+    // cache key differs from an unfiltered one for the same q/dates/forms.
+    params.set('q', `${query} -${eftsCikCacheKeyToken(entityFilter.cik_padded)}`);
   }
 
   const res = await pwFetch(`${EFTS_BASE}/search-index?${params}`, { headers: SEC_HEADERS });
@@ -1835,7 +2220,26 @@ async function searchFilings(
   // adsh (accession), and — for 8-Ks — items[] (e.g. "3.01"). The prior mapper
   // read entity_name/form_type/biz_location, which do NOT exist in this payload,
   // so every field but the date/id serialized as undefined and dropped.
-  const results = (data.hits?.hits ?? []).map((hit) => {
+  let guardDropped = 0;
+  const rawHits = data.hits?.hits ?? [];
+  const kept = entityFilter
+    ? rawHits.filter((hit) => {
+        // Re-verify the entity filter on every row rather than trusting efts —
+        // the same cache class that leaks an unfiltered result for a ciks
+        // query (fleet #619) means "the server said it filtered" is not proof.
+        const ok = (hit._source.ciks ?? []).some((c) => String(parseInt(c, 10)) === entityFilter!.cik);
+        if (!ok) guardDropped++;
+        return ok;
+      })
+    : rawHits;
+  // efts has a FIXED page size (verified live, fleet #3251: a `size=3` request
+  // still returned 100 hits) — the `size` param above is not honored, so
+  // `limit` has to be applied client-side or every call silently returns up
+  // to 100 rows regardless of what the caller asked for.
+  const eftsPageOversized = rawHits.length > count;
+  const trimmed = kept.slice(0, count);
+
+  const results = trimmed.map((hit) => {
     const s = hit._source;
     const display = s.display_names?.[0] ?? '';
     // display_names is "NAME  (TICKER)  (CIK 000...)" (double-space before each
@@ -1858,12 +2262,23 @@ async function searchFilings(
     };
   });
 
+  const totalHits = data.hits?.total?.value ?? 0;
+  const filtersDescription = `query="${query}", form_type=${formType ?? 'all'}, entity=${entityFilter ? `${entityFilter.company_name ?? entityFilter.cik} (CIK ${entityFilter.cik})` : 'all filers'}, date_range=${effStart ?? 'none'}..${effEnd ?? 'none'}`;
+
   return {
     query,
     form_type_filter: formType ?? 'all',
-    date_range: { start: startDate ?? null, end: endDate ?? null },
-    total_hits: data.hits?.total?.value ?? 0,
+    date_range: { start: effStart ?? null, end: effEnd ?? null },
+    entity_filter: entityFilter
+      ? { cik: entityFilter.cik, company_name: entityFilter.company_name ?? null, ticker: entityFilter.ticker ?? null, matched_by: entityFilter.matched_by }
+      : null,
+    total_hits: totalHits,
+    returned: results.length,
     results,
+    ...(totalHits === 0 ? { no_match: `No filings matched. Filters tried: ${filtersDescription}.` } : {}),
+    ...(guardDropped > 0 ? { entity_filter_guard_dropped: guardDropped } : {}),
+    ...(eftsPageOversized ? { note: `EDGAR's search index returns a fixed page of up to ${rawHits.length} matches regardless of the requested count; trimmed to the ${count} you asked for (total_hits is the true match count, independent of this page size).` } : {}),
+    snippet_note: 'EDGAR\'s search index returns no text snippet. To see the matching passage, pass `accession` from a result into edgar_filing_text with `search` set to this query (or a shorter phrase from it).',
   };
 }
 
@@ -3529,6 +3944,219 @@ async function filingText(
   };
 }
 
+// The raw directory listing (`${folder}/index.json`, what edgar_filing_documents
+// reads) carries a MIME-icon `type` per file ("text.gif", "compressed.gif") —
+// NOT the SEC exhibit number. The exhibit number ("EX-99.1") only appears on the
+// filing's own human -index.html page, in its "Document Format Files" table
+// (seq, description, document link, type, size). This is the general,
+// filer-agnostic way to find "the EX-99.1 attached to this filing" for ANY
+// company, not just Tesla — verified live against TSLA's 2026-10-02 8-K, whose
+// exhibit filename ("exhibit991111111.htm") carries no hint of "99.1" at all.
+function parseFilingIndexExhibits(html: string): Array<{ seq: string; description: string; filename: string; type: string }> {
+  const out: Array<{ seq: string; description: string; filename: string; type: string }> = [];
+  // Only the "Document Format Files" table — the sibling "Data Files" table
+  // (XBRL schema/linkbase files) uses the same row shape but isn't a document
+  // a caller would ever mean by "exhibit".
+  const tableMatch = html.match(/<table[^>]*class="tableFile"[^>]*summary="Document Format Files"[\s\S]*?<\/table>/i);
+  if (!tableMatch) return out;
+  const rowRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let row: RegExpExecArray | null;
+  while ((row = rowRe.exec(tableMatch[0])) !== null) {
+    const cellRe = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    const cells: string[] = [];
+    let cell: RegExpExecArray | null;
+    while ((cell = cellRe.exec(row[1])) !== null) cells.push(cell[1]);
+    if (cells.length < 4) continue; // header row or malformed
+    const seq = decodeHtml(cells[0].replace(/<[^>]+>/g, '').trim());
+    const description = decodeHtml(cells[1].replace(/<[^>]+>/g, '').trim());
+    const hrefMatch = cells[2].match(/href="([^"]+)"/i);
+    if (!hrefMatch) continue; // "Complete submission text file" row and similar have no useful link here
+    const filename = hrefMatch[1].split('/').pop()!.split(/[?#]/)[0];
+    const type = decodeHtml(cells[3].replace(/<[^>]+>/g, '').trim());
+    if (!filename || !seq || seq === ' ') continue; // skip the blank-seq "Complete submission" row
+    out.push({ seq, description, filename, type });
+  }
+  return out;
+}
+
+// Normalize an exhibit identifier the way a caller would type it ("99.1",
+// "EX-99.1", "ex99.1") to compare against the TYPE column's "EX-99.1" shape.
+function normalizeExhibitId(raw: string): string {
+  return raw.trim().toUpperCase().replace(/^EX-?/, '').replace(/\s+/g, '');
+}
+
+async function filingExhibitText(
+  accession: string | undefined,
+  tickerOrCik: string,
+  exhibitArg: string | undefined,
+  searchTerm?: string,
+  maxChars?: number,
+  offset?: number,
+  wantFormTypeArg?: string,
+  filedArg?: string,
+) {
+  if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
+    throw new Error(
+      'A company is required: pass `ticker` ("TSLA"), `cik` or their alias `ticker_or_cik` — plus either an accession or a form_type (e.g. edgar_filing_exhibit_text({ticker:"TSLA", form_type:"8-K"})).',
+    );
+  }
+  // Defaults to "8-K" (not "any type") when the caller named neither accession
+  // nor form_type: an exhibit worth reading for its own text is overwhelmingly
+  // the press release on an 8-K, and defaulting to "the single most recent
+  // filing of any type" (edgar_filing_documents' own fallback) would routinely
+  // land on an unrelated Form 4 or Form 144 between 8-Ks (the same trap
+  // edgar_filing_text's form_type doc warns about, fleet #2450).
+  const effectiveFormType = accession ? wantFormTypeArg : (wantFormTypeArg ?? '8-K');
+
+  const docsResult = (await filingDocuments(accession, tickerOrCik, false, effectiveFormType, filedArg)) as {
+    accession: string;
+    cik: string;
+    company: string | null;
+    form_type: string | null;
+    filing_date: string | null;
+    accession_source: 'caller' | 'auto_selected';
+    auto_selected?: Record<string, unknown>;
+  };
+
+  const acc = normalizeAccession(docsResult.accession)!;
+  const folder = `https://www.sec.gov/Archives/edgar/data/${docsResult.cik}/${acc.nodash}`;
+
+  const idxHtmlRes = await pwFetch(`${folder}/${acc.dashed}-index.html`, { headers: { 'User-Agent': SEC_HEADERS['User-Agent'] } });
+  if (!idxHtmlRes.ok) throw await httpError(idxHtmlRes, 'SEC EDGAR filing index page error');
+  const idxHtml = await idxHtmlRes.text();
+  const exhibits = parseFilingIndexExhibits(idxHtml);
+
+  if (!exhibits.length) {
+    throw new Error(
+      `Could not read the document table for accession ${acc.dashed}. Use edgar_filing_documents({accession:"${acc.dashed}", ticker_or_cik:"${tickerOrCik}"}) to list its files directly.`,
+    );
+  }
+
+  const wantExhibit = (exhibitArg ?? '').trim();
+  let matches: typeof exhibits;
+  if (wantExhibit) {
+    const norm = normalizeExhibitId(wantExhibit);
+    matches = exhibits.filter((e) => normalizeExhibitId(e.type) === norm || normalizeExhibitId(e.type).startsWith(norm + '.'));
+  } else {
+    matches = exhibits.filter((e) => /^EX-?99/i.test(e.type));
+  }
+
+  if (!matches.length) {
+    return {
+      accession: acc.dashed,
+      cik: docsResult.cik,
+      company: docsResult.company,
+      form_type: docsResult.form_type,
+      filing_date: docsResult.filing_date,
+      accession_source: docsResult.accession_source,
+      ...(docsResult.auto_selected ? { auto_selected: docsResult.auto_selected } : {}),
+      exhibit_requested: wantExhibit || 'EX-99.* (default — no exhibit matches this type in this filing)',
+      available_exhibits: exhibits.map((e) => ({ seq: e.seq, type: e.type || null, description: e.description || null, filename: e.filename })),
+      error: wantExhibit
+        ? `No exhibit matching "${wantExhibit}" in this filing. See \`available_exhibits\` for what this filing actually contains, and pass one of those \`type\` values as \`exhibit\`.`
+        : `This filing has no EX-99.* exhibit (the usual press-release attachment for Item 2.02/7.01 8-Ks). See \`available_exhibits\` and pass \`exhibit\` explicitly if one of those is the one wanted.`,
+    };
+  }
+
+  const chosen = matches[0];
+  const docUrl = `${folder}/${chosen.filename}`;
+  const { text: rawFetched, truncated: rawTruncated } = await fetchTextBounded(docUrl, { 'User-Agent': SEC_HEADERS['User-Agent'] }, FILING_DOC_MAX_BYTES);
+  // An individual exhibit document (unlike the primary iXBRL document) is
+  // routinely served with its SGML submission wrapper still attached --
+  // <DOCUMENT><TYPE>EX-99.1<SEQUENCE>2<FILENAME>...<DESCRIPTION>...<TEXT> --
+  // verified live on TSLA's 2026-10-02 EX-99.1. Untouched, htmlToText's tag
+  // stripper reads each SGML tag as an HTML tag and turns it into stray leading
+  // tokens ("EX-99.1", "2", the filename again, "Document") ahead of the real
+  // content. Strip everything through the first <TEXT> tag before stripping
+  // HTML, so a reader of the real content never sees SEC's filing-agent
+  // bookkeeping. A document with no such wrapper (the common case) is untouched.
+  const raw = rawFetched.replace(/^[\s\S]{0,400}?<text>\s*/i, (m) => (/^\s*<document>/i.test(m) ? '' : m));
+  const isHtml = /\.x?html?$/i.test(chosen.filename) || /^\s*</.test(raw);
+  const fullText = isHtml ? htmlToText(raw) : raw;
+  const documentChars = fullText.length;
+
+  const base = {
+    accession: acc.dashed,
+    cik: docsResult.cik,
+    company: docsResult.company,
+    form_type: docsResult.form_type,
+    filing_date: docsResult.filing_date,
+    accession_source: docsResult.accession_source,
+    ...(docsResult.auto_selected ? { auto_selected: docsResult.auto_selected } : {}),
+    exhibit: chosen.type || null,
+    exhibit_description: chosen.description || null,
+    document: chosen.filename,
+    document_url: docUrl,
+    source: 'U.S. Securities and Exchange Commission, EDGAR filing exhibits',
+    ...(exhibits.length > 1 ? { available_exhibits: exhibits.map((e) => ({ seq: e.seq, type: e.type || null, description: e.description || null, filename: e.filename })) } : {}),
+  };
+
+  const searchPhrases = [...new Set((searchTerm ?? '').split('|').map((p) => p.trim()).filter(Boolean))].slice(0, 5);
+
+  if (searchPhrases.length > 0) {
+    const buildOne = (term: string) => {
+      const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, term);
+      const wordHit = totalMatches === 0 ? findWordPassages(fullText, term) : null;
+      return wordHit
+        ? {
+          term,
+          match_mode: 'words' as const,
+          exact_matches: 0,
+          words: wordHit.words,
+          distinct_locations: wordHit.distinct_locations,
+          returned: wordHit.passages.length,
+          truncated: wordHit.distinct_locations > wordHit.passages.length,
+          passages: wordHit.passages,
+          note: `The exact phrase "${term}" does not appear in this exhibit, so these are passages holding its individual WORDS, ranked by how many of them each passage contains (then by a nearby figure). A word-level match is a lead, not a confirmation.`,
+        }
+        : {
+          term,
+          match_mode: 'exact' as const,
+          total_matches: totalMatches,
+          distinct_locations: distinctLocations,
+          returned: passages.length,
+          truncated: distinctLocations > passages.length,
+          passages,
+          note: totalMatches === 0
+            ? 'No case-insensitive match for this wording (nor any of its individual words) in this exhibit. That is a real answer, not a failure — retry with different wording, or this fact may be in a different exhibit (see `available_exhibits`).'
+            : 'Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order.',
+        };
+    };
+    const results = searchPhrases.map(buildOne);
+    const returnedChars = results.reduce((n, r) => n + r.passages.reduce((m, p) => m + p.text.length, 0), 0);
+    const searchTruncated = returnedChars < documentChars;
+
+    return {
+      ...base,
+      total_chars: documentChars,
+      returned_chars: returnedChars,
+      truncated: searchTruncated,
+      ...(searchTruncated
+        ? { truncated_note: `These are matched passages, not the exhibit: ${returnedChars} of ${documentChars} characters. Call again without \`search\` (or with a passage's \`offset\`) to read the surrounding text.` }
+        : {}),
+      ...(searchPhrases.length === 1 ? { search: results[0] } : { searches: searchPhrases.map((phrase, i) => ({ phrase, ...results[i] })) }),
+      ...(rawTruncated ? { raw_truncated: true } : {}),
+    };
+  }
+
+  const cap = Math.min(FILING_TEXT_CAP, Math.max(1000, Math.floor(Number(maxChars) || FILING_TEXT_DEFAULT_MAX)));
+  const off = Math.max(0, Math.floor(Number(offset) || 0));
+  const slice = fullText.slice(off, off + cap);
+  const end = off + slice.length;
+  const truncated = end < documentChars;
+
+  return {
+    ...base,
+    total_chars: documentChars,
+    offset: off,
+    returned_chars: slice.length,
+    truncated,
+    next_offset: truncated ? end : null,
+    ...(rawTruncated ? { raw_truncated: true } : {}),
+    text: slice,
+  };
+}
+
 // data.sec.gov answers a bare 404 both when no filer has the CIK at all and when
 // the filer exists but has never submitted XBRL financial data (investment funds,
 // trusts, individuals, most pre-2011 foreign private issuers). "SEC EDGAR company
@@ -4146,6 +4774,12 @@ async function companyConcept(
       accession: entry.accn as string | undefined,
       unit,
       derived: false as boolean | undefined,
+      // Duration this fact actually covers, in days — exposed so a caller (or
+      // this file's own logic below) never has to trust the SEC-assigned
+      // fiscal_period label to know the window. See the YTD-relabeling pass
+      // below (fleet #3187): a ~180d "Q2" is six months, not a quarter.
+      duration_days: entry.start ? spanDays(entry.start, entry.end) : undefined,
+      ytd: false as boolean,
       note: undefined as string | undefined,
       total_liquidity: undefined as LiquidityBreakdown | undefined,
     }))
@@ -4196,6 +4830,8 @@ async function companyConcept(
       accession: undefined, // arithmetic over FY + Q1-Q3, not a fact one filing states
       unit: fyRow.unit,
       derived: true,
+      duration_days: undefined, // no period_start to compute a span from
+      ytd: false,
       note: 'Computed as FY minus Q1-Q3 — SEC filers do not report a standalone Q4 fact.',
       total_liquidity: undefined,
     });
@@ -4261,6 +4897,8 @@ async function companyConcept(
       accession: undefined, // YTD(Q2) minus Q1 — spans two filings
       unit: q2ytd.unit,
       derived: true,
+      duration_days: spanDays(q1.period_end, q2ytd.period_end),
+      ytd: false, // this IS the discrete quarter — the YTD fact it was computed from keeps its own row, relabeled below
       note: `Computed as the YTD figure filed for Q2 (${q2ytd.value}, covering ${q2ytd.period_start}..${q2ytd.period_end}) minus Q1 (${q1.value}) — this filer reports this concept cumulatively in its 10-Q (a cash-flow-statement concept, typically), not quarter-only.`,
       total_liquidity: undefined,
     });
@@ -4281,6 +4919,8 @@ async function companyConcept(
         accession: undefined, // YTD(Q3) minus YTD(Q2) — spans two filings
         unit: q3ytd.unit,
         derived: true,
+        duration_days: spanDays(q2ytd.period_end, q3ytd.period_end),
+        ytd: false, // the discrete quarter; the YTD fact it was computed from keeps its own row, relabeled below
         note: `Computed as the YTD figure filed for Q3 (${q3ytd.value}) minus the YTD figure filed for Q2 (${q2ytd.value}) — this filer reports this concept cumulatively in its 10-Q, not quarter-only.`,
         total_liquidity: undefined,
       });
@@ -4289,6 +4929,33 @@ async function companyConcept(
   if (standaloneQuarters.length > 0) {
     entries.push(...standaloneQuarters);
     entries.sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
+  }
+
+  // RELABEL YTD-SHAPED AS-FILED FACTS (fleet #3187). The block above derives a
+  // discrete quarter FROM the as-filed cumulative fact but leaves that original
+  // fact in `entries` still labeled fiscal_period "Q2"/"Q3" — the SEC label for
+  // the period the filing covers, not the duration of the fact itself. A 180-day
+  // fact labeled "Q2" reads as a quarter to any caller that doesn't check
+  // duration_days, and `edgar_company_concept({concept:'capex', fiscal_year:2026})`
+  // on TSLA did exactly that: 8.282B (six months) presented as fiscal_period
+  // "Q2" alongside a discrete-quarter sibling nobody was told to prefer.
+  // Relabel BY DURATION (not by tag, so it covers any concept a filer reports
+  // this way) to "H1"/"9M" and mark `ytd:true`, so "Q2"/"Q3" always means a real
+  // quarter and the six/nine-month total is never presented as one. Runs AFTER
+  // the Q4 and standalone-quarter derivations above, which rely on the original
+  // Q2/Q3 labels to find their YTD legs, and BEFORE the period filter below, so
+  // a caller asking fiscal_period:"Q2" gets the discrete quarter, not the H1 total.
+  for (const e of entries) {
+    if (e.derived || e.unit.includes('/')) continue; // derived rows are already correctly labeled; ratio/per-share units don't sum/subtract meaningfully
+    if (e.fiscal_period === 'Q2' && e.duration_days != null && e.duration_days >= 170 && e.duration_days <= 190) {
+      e.fiscal_period = 'H1';
+      e.ytd = true;
+      e.note = `Six-month (H1) year-to-date figure (${e.period_start}..${e.period_end}), as filed — this filer reports this concept cumulatively in its 10-Q, not quarter-only. Not a Q2 quarterly figure; see the derived Q2 row for that.`;
+    } else if (e.fiscal_period === 'Q3' && e.duration_days != null && e.duration_days >= 260 && e.duration_days <= 290) {
+      e.fiscal_period = '9M';
+      e.ytd = true;
+      e.note = `Nine-month (9M) year-to-date figure (${e.period_start}..${e.period_end}), as filed — this filer reports this concept cumulatively in its 10-Q, not quarter-only. Not a Q3 quarterly figure; see the derived Q3 row for that.`;
+    }
   }
 
   // PERIOD FILTER (fleet #2058). `fiscal_year` and `fiscal_period` are the
@@ -4439,7 +5106,20 @@ async function companyConcept(
     }
   }
 
-  const latestFact = rows.find((e) => !e.derived) ?? null;
+  // `latest` must never be a bare YTD figure presented without saying so. The
+  // freshest row by period_end can now be an as-filed "H1"/"9M" fact (ytd:true,
+  // relabeled above) — when that happens, prefer its DERIVED discrete-quarter
+  // sibling at the same period_end instead (an exact subtraction within the
+  // same fiscal year, so it's trustworthy even though derived:true), the same
+  // way `values` already offers both. Q4 stays excluded from this preference:
+  // FY-minus-9M is the one case where no better reported fact exists at all, so
+  // it is never promoted to `latest` — a caller explicitly filtering
+  // fiscal_period:"Q4" still gets it from `values`.
+  const freshestEnd = rows[0]?.period_end;
+  const latestFact =
+    rows.find((e) => e.derived && e.fiscal_period !== 'Q4' && e.period_end === freshestEnd)
+    ?? rows.find((e) => !e.derived)
+    ?? null;
   let coverageBound: string | undefined;
   if (latestFact?.filed) {
     const daysSinceFiled = (Date.now() - Date.parse(latestFact.filed)) / 86400000;
@@ -5667,6 +6347,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.start_date as string | undefined,
         args.end_date as string | undefined,
         args.limit as number | undefined,
+        (args.entity ?? args.ticker_or_cik ?? args.cik ?? args.ticker) as string | undefined,
       );
     // Every tool below takes the same thing — a company — and this pack spells
     // it three ways across its own tools (`ticker_or_cik`, `cik`, `ticker`), so
@@ -5740,6 +6421,17 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         args.form_type as string | undefined,
         (args.search ?? args.contains ?? args.find ?? args.phrase) as string | undefined,
         (args.filed ?? args.filing_date ?? args.filed_date) as string | undefined,
+      );
+    case 'edgar_filing_exhibit_text':
+      return filingExhibitText(
+        args.accession as string | undefined,
+        (args.cik ?? args.ticker ?? args.ticker_or_cik) as string,
+        args.exhibit as string | undefined,
+        (args.search ?? args.contains ?? args.find ?? args.phrase) as string | undefined,
+        args.max_chars as number | undefined,
+        args.offset as number | undefined,
+        args.form_type as string | undefined,
+        (args.filed ?? args.filing_date) as string | undefined,
       );
     case 'edgar_ticker_to_cik':
       return tickerToCik((args.ticker ?? args.ticker_or_cik ?? args.company) as string);
