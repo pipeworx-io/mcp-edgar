@@ -10,7 +10,7 @@ import pack from './index.js';
 
 
 const server = new Server(
-  { name: '@pipeworx/mcp-edgar', version: '0.3.13' },
+  { name: '@pipeworx/mcp-edgar', version: '0.3.14' },
   { capabilities: { tools: {} } },
 );
 

@@ -382,10 +382,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -1967,7 +1983,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_text',
     description:
-      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. A `search` response carries ONLY the matched passages, so it reports `returned_chars` against `total_chars` and sets `truncated:true` whenever those differ — read a figure\'s absence from it as "the phrase did not match there", never as "the filing does not say it", and re-read without `search` (or at a passage `offset`) to confirm. (Do not read `search.truncated` as a completeness signal: it is about the SEARCH — false means every distinct match location was returned — and is routinely false on a response holding a third of the document.) **For a question asking two facts from the same filing** ("revenue and test volume in the latest 10-Q"), pass `search` as `|`-separated phrases (e.g. "revenue|tests processed") to get both in this one call under `searches[]` — and when a phrase names a financial total (revenue, net income, EPS, ...), the matching XBRL figure for this exact accession comes back under `xbrl` even if that total never appears as an absolute number in the prose (common: filings often state only the growth delta/percentage in text). Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
+      'AUTHORITATIVE full text of a SEC filing\'s primary document (10-K / 10-Q / 8-K body), HTML stripped to clean plaintext — the source for disclosures that live in prose, not XBRL: going-concern language, ATM / at-the-market equity facilities, committed-equity share caps, public-float figures, subsequent events, the liquidity footnote, and MD&A KPIs XBRL never tags (test volume, units shipped, subscriber counts, same-store sales). Pass an accession (from edgar_search_filings / edgar_company_filings) plus the filer\'s ticker or CIK; OR omit accession and pass ticker + form_type to auto-resolve the latest matching filing. **For a specific fact inside a long filing, pass `search`** (a word or exact phrase, e.g. "tests processed" or "processed approximately") instead of paging blind — it scans the WHOLE document (before any offset/max_chars windowing) and returns every matching passage with surrounding context and its own `offset` in the document, so a KPI ~100k characters in is found in one call instead of paging through `max_chars` windows by hand. A zero-match `search` on a fully-read document (`status: "not_found"`) is a real answer (the filing does not use that exact wording) — retry with a shorter or different phrase rather than assuming the tool failed. On a `raw_truncated` document a zero is `status: "not_found_within_scanned_portion"`: the phrase was not found in the first `scanned_chars` characters, which is NOT evidence the filing lacks it. A `search` response carries ONLY the matched passages, so it reports `returned_chars` against `total_chars` and sets `truncated:true` whenever those differ — read a figure\'s absence from it as "the phrase did not match there", never as "the filing does not say it", and re-read without `search` (or at a passage `offset`) to confirm. (Do not read `search.truncated` as a completeness signal: it is about the SEARCH — false means every distinct match location was returned — and is routinely false on a response holding a third of the document.) **For a question asking two facts from the same filing** ("revenue and test volume in the latest 10-Q"), pass `search` as `|`-separated phrases (e.g. "revenue|tests processed") to get both in this one call under `searches[]` — and when a phrase names a financial total (revenue, net income, EPS, ...), the matching XBRL figure for this exact accession comes back under `xbrl` even if that total never appears as an absolute number in the prose (common: filings often state only the growth delta/percentage in text). Optionally set `section` to return just one part (going_concern | liquidity | capital_resources | subsequent_events | risk_factors — 10-K Item 1A, bounded from its heading to the next Item heading, table-of-contents hits and cross-references skipped; the response carries `section_diagnostics` with its length and where it ended); `search` runs within that slice when both are given. Large docs (a 10-Q is ~100k+ chars of text) are PAGED, not spilled, when `search` is not used: the result caps at `max_chars` (default 50000) from `offset`, and returns `truncated` + `next_offset` — pass next_offset back as `offset` to read the next window. An especially large filing (e.g. an S-1 with heavy inline-XBRL tagging can exceed 10MB of raw HTML) is also capped on the READ side — the response sets `raw_truncated:true` when only the first portion of the document was read at all, which bounds how far `offset` can page (and how far `search` can scan) and can make a late section or search term come back not-found even though it exists further in. Use for "does $TICKER disclose substantial doubt / going concern", "what ATM facility does $TICKER have", "read the liquidity section of the latest 10-Q", "how many tests did $TICKER process this quarter". For the list of documents/exhibits in a filing use edgar_filing_documents; for structured financial numbers use edgar_company_concept.',
     summary: 'The full text of an SEC filing\'s main document, HTML stripped to clean plaintext.',
     inputSchema: {
       type: 'object' as const,
@@ -1995,8 +2011,8 @@ const tools: McpToolExport['tools'] = [
         },
         section: {
           type: 'string',
-          enum: ['going_concern', 'liquidity', 'capital_resources', 'subsequent_events'],
-          description: 'Return only this section (located by heading). Omit for the whole document. Unmatched sections fall back to the whole document (section_found:false).',
+          enum: ['going_concern', 'liquidity', 'capital_resources', 'subsequent_events', 'risk_factors'],
+          description: 'Return only this section (located by heading). Omit for the whole document. Unmatched sections fall back to the whole document (section_found:false). risk_factors applies to 10-K text only and is the filer-written wording, untagged: it is not a classification of the risks.',
         },
         max_chars: {
           type: 'number',
@@ -2033,7 +2049,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_filing_exhibit_text',
     description:
-      'Full text of an EXHIBIT attached to a filing — not the filing\'s own primary document (use edgar_filing_text for that). This is the only way to read an 8-K\'s Exhibit 99.1/99.2 press release — a quarterly production-and-delivery report, an earnings release, a KPI update — because the 8-K body itself routinely just says "see the attached exhibit" and carries none of the numbers; the figures live in the exhibit document. Pass the filer\'s `ticker` or `cik` plus either an `accession` (from edgar_company_filings) or a `form_type` to auto-resolve the latest matching filing (defaults to "8-K" when both accession and form_type are omitted, since that is overwhelmingly when an exhibit holds the operative content). Set `exhibit` to pick a specific attachment by its SEC-assigned type — "99.1", "99", "10.1" — read off the filing\'s own document index (case-insensitive, the "EX-" prefix optional); omit it to default to the first EX-99.* exhibit, which is the convention Item 2.02 (earnings) and Item 7.01 (Reg FD) 8-Ks use for a press release. When the requested exhibit is not found (or none exists), the response lists every exhibit actually in the filing under `available_exhibits` rather than failing silently. **For a specific number inside the exhibit, pass `search`** (a short phrase likely to appear verbatim, e.g. "vehicle deliveries", "Megapack", "energy storage") the same way edgar_filing_text does — it scans the whole exhibit and returns matching passages ranked by a nearby figure, with `|`-separated phrases for more than one fact in one call; a zero-match search is a real answer (try different wording) and falls back to a word-level match when the exact phrase misses. Without `search`, the exhibit text is returned paged (`max_chars`/`offset`, same convention as edgar_filing_text) since a press release can run several thousand words. Use for "Tesla\'s Q3 2026 vehicle deliveries and production", "what did $TICKER\'s earnings press release say about [KPI]", "read the exhibit attached to $TICKER\'s latest 8-K". Source: U.S. Securities and Exchange Commission, EDGAR filing exhibits (the same primary-source filings edgar_filing_text and edgar_filing_documents read).',
+      'Full text of an EXHIBIT attached to a filing — not the filing\'s own primary document (use edgar_filing_text for that). This is the only way to read an 8-K\'s Exhibit 99.1/99.2 press release — a quarterly production-and-delivery report, an earnings release, a KPI update — because the 8-K body itself routinely just says "see the attached exhibit" and carries none of the numbers; the figures live in the exhibit document. Pass the filer\'s `ticker` or `cik` plus either an `accession` (from edgar_company_filings) or a `form_type` to auto-resolve the latest matching filing (defaults to "8-K" when both accession and form_type are omitted, since that is overwhelmingly when an exhibit holds the operative content). Set `exhibit` to pick a specific attachment by its SEC-assigned type — "99.1", "99", "10.1" — read off the filing\'s own document index (case-insensitive, the "EX-" prefix optional); omit it to default to the first EX-99.* exhibit, which is the convention Item 2.02 (earnings) and Item 7.01 (Reg FD) 8-Ks use for a press release. When the requested exhibit is not found (or none exists), the response lists every exhibit actually in the filing under `available_exhibits` rather than failing silently. **For a specific number inside the exhibit, pass `search`** (a short phrase likely to appear verbatim, e.g. "vehicle deliveries", "Megapack", "energy storage") the same way edgar_filing_text does — it scans the whole exhibit and returns matching passages ranked by a nearby figure, with `|`-separated phrases for more than one fact in one call; a zero-match search is a real answer when `raw_truncated` is absent (try different wording); with `raw_truncated: true` it is `status: "not_found_within_scanned_portion"` and inconclusive and falls back to a word-level match when the exact phrase misses. Without `search`, the exhibit text is returned paged (`max_chars`/`offset`, same convention as edgar_filing_text) since a press release can run several thousand words. Use for "Tesla\'s Q3 2026 vehicle deliveries and production", "what did $TICKER\'s earnings press release say about [KPI]", "read the exhibit attached to $TICKER\'s latest 8-K". Source: U.S. Securities and Exchange Commission, EDGAR filing exhibits (the same primary-source filings edgar_filing_text and edgar_filing_documents read).',
     summary: 'Full text of an exhibit (e.g. a press release) attached to an SEC filing, such as an 8-K\'s EX-99.1.',
     inputSchema: {
       type: 'object' as const,
@@ -3133,6 +3149,30 @@ async function fetchTextBounded(url: string, headers: Record<string, string>, ma
 // stated limit, not a silent gap — rather than never answering at all.
 const FILING_DOC_MAX_BYTES = 4_000_000;
 
+/**
+ * What a search result MEANS given how much of the document was read (fleet #3562).
+ * A zero-match search over a document whose raw HTML hit the read cap
+ * (`raw_truncated`) only says the phrase is absent from the portion scanned.
+ * Before this, such a zero carried the same `status`-less empty array and a note
+ * calling it "a real answer", so a model read "no going-concern language" off a
+ * scan that never reached the notes. `status` is the distinct, checkable field:
+ *   found | not_found | not_found_within_scanned_portion (zero over a capped read)
+ *   | word_lead_only | word_lead_only_within_scanned_portion.
+ */
+function searchStatus(
+  found: boolean,
+  wordMode: boolean,
+  rawTruncated: boolean,
+): { status: string; scan_note?: string } {
+  if (found) return { status: 'found' };
+  if (!rawTruncated) return { status: wordMode ? 'word_lead_only' : 'not_found' };
+  return {
+    status: wordMode ? 'word_lead_only_within_scanned_portion' : 'not_found_within_scanned_portion',
+    scan_note:
+      'INCONCLUSIVE: the document was only PARTLY read (raw_truncated: true) — see `scanned_chars` on the response for how far this scan reached. The phrase was not found WITHIN that portion; it may well appear in the part that was never read. Do NOT conclude the filing omits this wording. Retry with a different phrase, use `section` (it reads from the same capped text), or open the filing at document_url.',
+  };
+}
+
 // Strip an HTML document to readable plaintext. Workers have no DOMParser;
 // drop script/style blocks, remove tags, decode entities, collapse whitespace.
 function htmlToText(html: string): string {
@@ -3259,6 +3299,117 @@ const AUTO_SELECT_SCAN = 4;
 const AUTO_SELECT_LIST = 8;
 
 /**
+ * Item 1A (Risk Factors) of a 10-K, bounded at BOTH ends. Unlike the other
+ * sections (anchor to end-of-document), a risk-factors slice must stop at the
+ * next Item heading, or "Item 1A text" would silently be 1A + the rest of the
+ * filing.
+ *
+ * The failure this is built around is returning a plausible-looking wrong
+ * chunk: the table-of-contents line ("Item 1A. Risk Factors 5 Item 1B ..."),
+ * a cross-reference ("see Item 1A. Risk Factors"), a running page header
+ * ("Item 1A. Risk Factors (Continued)"), or a section that stops early at one
+ * of those. So: collect every heading-shaped start, drop the ones that read
+ * as references or running headers, pair each start with the next Item
+ * 1B/1C/2 heading, and keep the start whose slice is LONGEST. A TOC entry's
+ * slice runs to the next TOC line (tens of characters); the real section is
+ * thousands. Pure text, deterministic, no model.
+ */
+// Some filers' HTML-to-text leaves ONE stray space inside a heading word
+// ("RIS K FACTORS" Microsoft, "R isk Factors" Oracle, "Item 1 A" Prdo): the
+// literal heading then never matches and only the contents line is found.
+// tol(word) accepts the word whole or with a single space at any inner
+// position. One space per word, never a wildcard run, so it cannot widen into
+// unrelated text; the RF_MIN_PLAUSIBLE_CHARS floor below stays the backstop.
+function tol(word: string): string {
+  const alts = [word];
+  for (let i = 1; i < word.length; i++) alts.push(`${word.slice(0, i)}\\s${word.slice(i)}`);
+  return `(?:${alts.join('|')})`;
+}
+const RF_PUNCT = '[.:\\-\\u2013\\u2014]?';
+const RF_START = new RegExp(`\\b${tol('item')}\\s*${tol('1a')}\\s*${RF_PUNCT}\\s*${tol('risk')}\\s+${tol('factors')}`, 'gi');
+const RF_END = new RegExp(
+  `\\b${tol('item')}\\s*(?:${tol('1b')}\\s*${RF_PUNCT}\\s*${tol('unresolved')}\\s+${tol('staff')}|${tol('1c')}\\s*${RF_PUNCT}\\s*${tol('cybersecurity')}|2\\s*${RF_PUNCT}\\s*(?:${tol('description')}\\s+${tol('of')}\\s+)?${tol('propert')})`,
+  'gi',
+);
+const RF_REF_WORDS = /(?:\b(?:see|in|under|and|to|of|at|with|within|also|by|from|the|this|our|its|entitled|captioned|heading)\s*|[“"'‘(])$/i;
+
+function isHeadingShaped(text: string, idx: number, len: number): boolean {
+  const before = text.slice(Math.max(0, idx - 24), idx).replace(/[\s\u00a0]+$/, '');
+  if (RF_REF_WORDS.test(before)) return false;
+  const after = text.slice(idx + len, idx + len + 24).replace(/^[\s\u00a0.]+/, '');
+  if (/^[”"’')]/.test(after)) return false; // ...“Item 1A. Risk Factors” cross-reference
+  if (/^\(?\s*continued\b/i.test(after)) return false; // running page header
+  if (/^(?:of|in|above|below|under|for|and|section|herein|generally)\b/.test(after)) return false;
+  return true;
+}
+
+// Below this a slice is not a risk-factors section, it is an index/cross-reference
+// line that won the longest-slice rule unopposed (Intel FY2025: 32 chars, a
+// "Pages 37 - 48" index entry, one heading candidate). Chosen from the
+// measured gap: the failure is tens of characters and the smallest genuine
+// section measured is 31,270 (Intrusion FY2025); 1,000 sits ~30x above the
+// failure and ~30x below the smallest true section. The smaller-reporting-
+// company "not required" statement is exempt: it is legitimately tiny and has
+// its own not_required flag.
+export const RF_MIN_PLAUSIBLE_CHARS = 1000;
+
+export function extractRiskFactors(
+  fullText: string,
+): { text: string; implausible: boolean; diagnostics: Record<string, unknown> } | null {
+  const starts: number[] = [];
+  let skippedRefs = 0;
+  for (const m of fullText.matchAll(RF_START)) {
+    if (m.index === undefined) continue;
+    if (isHeadingShaped(fullText, m.index, m[0].length)) starts.push(m.index);
+    else skippedRefs++;
+  }
+  if (starts.length === 0) return null;
+  const ends: Array<{ idx: number; label: string }> = [];
+  for (const m of fullText.matchAll(RF_END)) {
+    if (m.index === undefined) continue;
+    if (!isHeadingShaped(fullText, m.index, m[0].length)) continue;
+    const t = m[0].toLowerCase().replace(/\s+/g, '');
+    ends.push({ idx: m.index, label: t.includes('1b') ? 'Item 1B' : t.includes('1c') ? 'Item 1C' : 'Item 2' });
+  }
+  let best: { start: number; end: number; label: string | null } | null = null;
+  for (const st of starts) {
+    const e = ends.find((x) => x.idx > st);
+    const end = e ? e.idx : fullText.length;
+    if (!best || end - st > best.end - best.start) best = { start: st, end, label: e ? e.label : null };
+  }
+  const b = best!;
+  // Drop the page number the stripped HTML leaves glued to the section's last line ("... retention. 32").
+  const text = fullText.slice(b.start, b.end).trim().replace(/\s+\d{1,3}$/, '');
+  // A real Item 1A is thousands of characters; the exceptions are filers who
+  // say "not required for smaller reporting companies" — report that as what
+  // it is rather than a bare short string that reads like a failed parse.
+  const notRequired = text.length < 2500 && /not\s+required|smaller\s+reporting\s+compan/i.test(text);
+  const implausible = !notRequired && text.length < RF_MIN_PLAUSIBLE_CHARS;
+  return {
+    text,
+    implausible,
+    diagnostics: {
+      start_offset: b.start,
+      end_offset: b.end,
+      section_chars: text.length,
+      ended_at: b.label ?? 'end_of_document',
+      heading_candidates: starts.length,
+      references_skipped: skippedRefs,
+      ...(b.label === null
+        ? { warning: 'No Item 1B/1C/2 heading followed the start, so this runs to the end of the text read: the section may be longer than the real Item 1A.' }
+        : {}),
+      ...(notRequired
+        ? { not_required: true, note: 'This filer states Item 1A is not required (smaller reporting company); the text is that statement, not omitted risk factors.' }
+        : implausible
+          ? { warning: `Only ${text.length} characters, which is an index or cross-reference line rather than a risk-factors section (some filers place Item 1A in a cross-reference index and write the risks under an unnumbered heading). Not returned as the section: section_found is false and the whole document is returned.` }
+        : text.length < 2500
+          ? { warning: `Only ${text.length} characters — shorter than a real risk-factors section normally is. Treat as suspect (possible table-of-contents hit or a filer that incorporates risk factors by reference).` }
+          : {}),
+    },
+  };
+}
+
+/**
  * The `section` slice of a filing's text, as a function rather than inline, so
  * the auto-selection walk below can score a candidate against the SAME text
  * the search will actually run on. `section` is best-effort: an unmatched
@@ -3267,9 +3418,22 @@ const AUTO_SELECT_LIST = 8;
 export function sliceFilingSection(
   fullText: string,
   section: string | undefined,
-): { text: string; applied: string | null; found: string | boolean | null } {
-  const sec = (section ?? '').trim().toLowerCase();
+): { text: string; applied: string | null; found: string | boolean | null; diagnostics?: Record<string, unknown> } {
+  const sec = (section ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
   if (!sec) return { text: fullText, applied: null, found: null };
+  if (sec === 'risk_factors' || sec === 'item_1a') {
+    const r = extractRiskFactors(fullText);
+    if (!r) return { text: fullText, applied: null, found: false };
+    if (r.implausible) {
+      return {
+        text: fullText,
+        applied: null,
+        found: false,
+        diagnostics: { ...r.diagnostics, rejected_slice_chars: r.text.length, rejected_slice_text: r.text.slice(0, 120) },
+      };
+    }
+    return { text: r.text, applied: 'risk_factors', found: true, diagnostics: r.diagnostics };
+  }
   const conf = FILING_SECTION_PATTERNS[sec];
   if (!conf) return { text: fullText, applied: null, found: `unknown_section:${sec}` };
   const idxs: number[] = [];
@@ -3592,6 +3756,82 @@ export function findWordPassages(
   };
 }
 
+// --- holding-company reorganisations (fleet #3563) -------------------------
+// SEC's ticker map gives each ticker ONE cik. When a company reorganises under
+// a new holding company the ticker moves to the new registrant (XOM ->
+// ExxonMobil Holdings Corp, cik 2115436, proxy material only) while the 10-K
+// history stays under the old one (EXXON MOBIL CORP, cik 34088). By ticker the
+// caller then got "no 10-K found" about one of the largest filers in the
+// market. A sibling is accepted ONLY when its name, stripped of corporate
+// boilerplate and spacing, EQUALS the resolved registrant's AND it really holds
+// the requested form: "ExxonMobil Holdings Corp" and "EXXON MOBIL CORP" both
+// reduce to "EXXONMOBIL"; "ExxonMobil Renewables LLC" does not.
+const REGISTRANT_BOILERPLATE = new Set([
+  'THE', 'A', 'INC', 'CORP', 'CORPORATION', 'CO', 'COMPANY', 'LTD', 'LIMITED', 'LLC', 'LP', 'PLC',
+  'SA', 'AG', 'NV', 'GMBH', 'AB', 'AS', 'OY', 'SPA', 'GROUP', 'HOLDINGS', 'HOLDING', 'AND', 'OF',
+  'US', 'USA',
+]);
+// Words like INTERNATIONAL / GLOBAL / NEW / TRUST / FUND are deliberately NOT
+// stripped: "Eastern International Ltd" and "The Eastern Company" are different
+// registrants (measured in the fleet #3563 survey), and a wrong redirect is worse
+// than the not-found it replaces. SIC is compared as a second guard.
+
+const SIBLING_MAX_AGE_DAYS = 800;
+
+export function registrantCore(name: string): string {
+  return name
+    .replace(/\([^)]*\)/g, ' ')
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t && !REGISTRANT_BOILERPLATE.has(t))
+    .join('');
+}
+
+async function findSiblingFilers(
+  ownName: string,
+  ownCik: string,
+  wantFormTypeArg: string,
+  ownSic?: string,
+): Promise<{ cik: string; name: string; accession: string; filed: string | null }[]> {
+  const core = registrantCore(ownName);
+  if (core.length < 5) return [];
+  const res = await pwFetch(
+    `https://efts.sec.gov/LATEST/search-index?keysTyped=${encodeURIComponent(core.slice(0, 5).toLowerCase())}`,
+    { headers: SEC_HEADERS },
+  ).catch(() => null);
+  if (!res || !res.ok) return [];
+  const data = (await res.json().catch(() => null)) as
+    | { hits?: { hits?: { _id: string; _source?: { entity?: string } }[] } }
+    | null;
+  const hits = (data?.hits?.hits ?? [])
+    .filter((h) => /^\d+$/.test(h._id) && h._source?.entity)
+    .map((h) => ({ cik: String(Number(h._id)), name: h._source!.entity! }))
+    .filter((h) => h.cik !== ownCik && registrantCore(h.name) === core)
+    .slice(0, 4);
+  const found: { cik: string; name: string; accession: string; filed: string | null }[] = [];
+  for (const h of hits) {
+    const r = await pwFetch(`${DATA_BASE}/submissions/CIK${padCik(h.cik)}.json`, { headers: SEC_HEADERS }).catch(() => null);
+    if (!r || !r.ok) continue;
+    const sub = (await r.json().catch(() => null)) as
+      | { sic?: string; filings?: { recent?: { accessionNumber?: string[]; form?: string[]; filingDate?: string[] } } }
+      | null;
+    const rec = sub?.filings?.recent;
+    if (!rec) continue;
+    if (ownSic && sub?.sic && sub.sic !== ownSic) continue; // same name, different industry: not the same company
+    const idx = findFormIndices(rec.form ?? [], wantFormTypeArg, rec.filingDate ?? [], null, 1)[0];
+    // A registrant that last filed this form years ago is a dead namesake
+    // (measured: DMRC's same-named cik last filed a 10-K in 2008), not the
+    // predecessor of a fresh reorganisation.
+    const filed = rec.filingDate?.[idx ?? -1] ?? '';
+    if (!filed || Date.parse(filed) < Date.now() - SIBLING_MAX_AGE_DAYS * 86_400_000) continue;
+    if (idx !== undefined && rec.accessionNumber?.[idx]) {
+      found.push({ cik: h.cik, name: h.name, accession: rec.accessionNumber[idx], filed: rec.filingDate?.[idx] ?? null });
+    }
+  }
+  return found;
+}
+
 // Fetch ONE filing's primary-document text, HTML-stripped, paged. Splitting this
 // out (rather than piggybacking edgar_filing_documents' include_primary_text,
 // which caps at 40k and can't page) lets the register pull deep disclosures —
@@ -3605,7 +3845,8 @@ async function filingText(
   wantFormTypeArg?: string,
   searchTerm?: string,
   filedArg?: string,
-) {
+  siblingOf?: string,
+): Promise<any> {
   if (typeof tickerOrCik !== 'string' || !tickerOrCik.trim()) {
     throw new Error('A company is required: pass `ticker` ("ACTU"), `cik` or their alias `ticker_or_cik` — plus either an accession or a form_type (e.g. edgar_filing_text({ticker:"ACTU", form_type:"10-Q"})).');
   }
@@ -3623,6 +3864,7 @@ async function filingText(
   if (!subRes.ok) throw new Error(`SEC submissions lookup failed (HTTP ${subRes.status}) for ${tickerOrCik}.`);
   const sub = (await subRes.json()) as {
     name?: string;
+    sic?: string;
     filings?: { recent?: { accessionNumber?: string[]; form?: string[]; filingDate?: string[]; primaryDocument?: string[] } };
   };
   const r = sub.filings?.recent;
@@ -3714,6 +3956,26 @@ async function filingText(
     }
     const candidateIdx = findFormIndices(forms, wantFormTypeArg, filingDates, filedPrefix, AUTO_SELECT_LIST)
       .filter((idx) => !!accs[idx] && !!normalizeAccession(accs[idx]));
+    if (!candidateIdx.length && wantForm && !siblingOf && !isNumericCik(tickerOrCik) && sub.name) {
+      // Ticker resolved to a registrant that has never filed this form. Look
+      // for the sibling registrant that carries the history (holdco reorg).
+      const sibs = await findSiblingFilers(sub.name, cikNoZeros, wantForm, sub.sic);
+      if (sibs.length === 1) {
+        const redirected = await filingText(undefined, sibs[0].cik, section, maxChars, offset, wantFormTypeArg, searchTerm, filedArg, cikNoZeros);
+        return {
+          ...redirected,
+          registrant_redirect: {
+            asked_for: tickerOrCik,
+            resolved_to: { cik: cikNoZeros, company: sub.name, note: `has no ${wantForm} on file` },
+            read_instead: { cik: sibs[0].cik, company: sibs[0].name },
+            why: `"${tickerOrCik}" resolves to ${sub.name} (CIK ${cikNoZeros}), which has filed no ${wantForm}. ${sibs[0].name} (CIK ${sibs[0].cik}) has the same name and does file one — typical after a holding-company reorganisation, where the ticker moves to the new registrant and the filing history stays with the old one. This response reads ${sibs[0].name}'s filing.`,
+          },
+        };
+      }
+      if (sibs.length > 1) {
+        throw new Error(`No ${wantForm} filing found for ${tickerOrCik}: it resolves to ${sub.name} (CIK ${cikNoZeros}), which has filed none. Same-named registrants that do file one: ${sibs.map((x) => `${x.name} (CIK ${x.cik})`).join('; ')}. Ask again with one of those CIKs as ticker_or_cik.`);
+      }
+    }
     if (!candidateIdx.length) {
       const dateClause = filedPrefix ? ` dated ${filedPrefix}` : '';
       throw new Error(`No ${wantForm ?? 'recent'} filing${dateClause} found for ${tickerOrCik}. Use edgar_company_filings({ticker_or_cik:"${tickerOrCik}"${wantForm ? `, form_type:"${wantForm}"` : ''}}) to list filings, then pass an accession.`);
@@ -3790,6 +4052,7 @@ async function filingText(
   fullText = sliced.text;
   const sectionApplied = sliced.applied;
   const sectionFound = sliced.found;
+  const sectionDiagnostics = sliced.diagnostics;
 
   // `search` short-circuits the normal offset/max_chars windowing: it scans
   // the whole (possibly section-sliced) document and returns matching
@@ -3835,7 +4098,13 @@ async function filingText(
             ? 'No case-insensitive match for this wording (nor, for a multi-word phrase, for any of its individual words) in the document (or section, if one was given). That is a real answer, not a failure — retry with different wording or drop `section` to search the whole document.'
             : `Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order. Each passage's offset is a position in the document text — pass it as \`offset\` (without \`search\`) to read more surrounding text via the normal paged text field.`,
         };
-      return xbrl ? { ...base, xbrl } : base;
+      const st = searchStatus(totalMatches > 0, wordHit !== null, rawTruncated);
+      const out = {
+        ...base,
+        status: st.status,
+        ...(st.scan_note ? { note: st.scan_note + (wordHit ? ' ' + base.note : ''), scanned_chars: documentChars } : {}),
+      };
+      return xbrl ? { ...out, xbrl } : out;
     };
 
     const results = await Promise.all(searchPhrases.map(buildOne));
@@ -3881,6 +4150,7 @@ async function filingText(
       document_url: docUrl,
       section: sectionApplied,
       ...(sectionFound !== null ? { section_found: sectionFound } : {}),
+      ...(sectionDiagnostics ? { section_diagnostics: sectionDiagnostics } : {}),
       total_chars: fullText.length,
       ...(fullText.length !== documentChars ? { document_chars: documentChars } : {}),
       returned_chars: returnedChars,
@@ -3899,7 +4169,8 @@ async function filingText(
       ...(rawTruncated
         ? {
             raw_truncated: true,
-            raw_truncated_note: `This document's raw HTML exceeds the ${(FILING_DOC_MAX_BYTES / 1_000_000).toFixed(0)}MB this tool reads in one call, so the search above only scanned the portion read — NOT the whole filing. Treat total_matches:0 as inconclusive, not "absent", for a raw_truncated document.`,
+            scanned_chars: documentChars,
+            raw_truncated_note: `This document's raw HTML exceeds the ${(FILING_DOC_MAX_BYTES / 1_000_000).toFixed(0)}MB this tool reads in one call, so the search above only scanned the first ${documentChars} characters of text — NOT the whole filing. A phrase with status "not_found_within_scanned_portion" is inconclusive, not "absent".`,
           }
         : {}),
     };
@@ -3924,6 +4195,7 @@ async function filingText(
     document_url: docUrl,
     section: sectionApplied,
     ...(sectionFound !== null ? { section_found: sectionFound } : {}),
+    ...(sectionDiagnostics ? { section_diagnostics: sectionDiagnostics } : {}),
     total_chars: total,
     // A section slice reframed `total_chars` to the slice (fleet #3316): say so,
     // or a 2,000-char section of a 400,000-char 10-K reads as a whole document.
@@ -3937,7 +4209,7 @@ async function filingText(
     ...(rawTruncated
       ? {
           raw_truncated: true,
-          raw_truncated_note: `This document's raw HTML exceeds the ${(FILING_DOC_MAX_BYTES / 1_000_000).toFixed(0)}MB this tool reads in one call, so total_chars/text above reflect only the portion read — NOT the whole filing. A section search (going_concern/liquidity/capital_resources/subsequent_events) that picks the LAST occurrence may miss content past this cutoff, since large filings' later sections (financial statement notes, subsequent events) can fall beyond it. Treat section_found:false as inconclusive, not "absent", for a raw_truncated document.`,
+          raw_truncated_note: `This document's raw HTML exceeds the ${(FILING_DOC_MAX_BYTES / 1_000_000).toFixed(0)}MB this tool reads in one call, so total_chars/text above reflect only the portion read — NOT the whole filing. A section search (going_concern/liquidity/capital_resources/subsequent_events; risk_factors instead runs to the end of the text read, with a warning) that picks the LAST occurrence may miss content past this cutoff, since large filings' later sections (financial statement notes, subsequent events) can fall beyond it. Treat section_found:false as inconclusive, not "absent", for a raw_truncated document.`,
         }
       : {}),
     text: slice,
@@ -4097,7 +4369,8 @@ async function filingExhibitText(
     const buildOne = (term: string) => {
       const { total: totalMatches, distinct_locations: distinctLocations, passages } = findPassages(fullText, term);
       const wordHit = totalMatches === 0 ? findWordPassages(fullText, term) : null;
-      return wordHit
+      const st = searchStatus(totalMatches > 0, wordHit !== null, rawTruncated);
+      const r = wordHit
         ? {
           term,
           match_mode: 'words' as const,
@@ -4121,6 +4394,11 @@ async function filingExhibitText(
             ? 'No case-insensitive match for this wording (nor any of its individual words) in this exhibit. That is a real answer, not a failure — retry with different wording, or this fact may be in a different exhibit (see `available_exhibits`).'
             : 'Passages carrying a nearby number (a likely KPI figure) are ranked first; the rest keep document order.',
         };
+      return {
+        ...r,
+        status: st.status,
+        ...(st.scan_note ? { note: st.scan_note + (wordHit ? ' ' + r.note : ''), scanned_chars: documentChars } : {}),
+      };
     };
     const results = searchPhrases.map(buildOne);
     const returnedChars = results.reduce((n, r) => n + r.passages.reduce((m, p) => m + p.text.length, 0), 0);
@@ -4135,7 +4413,7 @@ async function filingExhibitText(
         ? { truncated_note: `These are matched passages, not the exhibit: ${returnedChars} of ${documentChars} characters. Call again without \`search\` (or with a passage's \`offset\`) to read the surrounding text.` }
         : {}),
       ...(searchPhrases.length === 1 ? { search: results[0] } : { searches: searchPhrases.map((phrase, i) => ({ phrase, ...results[i] })) }),
-      ...(rawTruncated ? { raw_truncated: true } : {}),
+      ...(rawTruncated ? { raw_truncated: true, scanned_chars: documentChars } : {}),
     };
   }
 
@@ -4727,6 +5005,13 @@ async function companyConcept(
   //     (fy, fp, end) tuple. Keep the most-recently-filed version.
   type Raw = { start?: string; end: string; val: number; accn: string; fy: number; fp: string; form: string; filed: string; frame?: string };
   const spanDays = (a?: string, b?: string) => (a && b) ? Math.round((Date.parse(b) - Date.parse(a)) / 86400000) : NaN;
+  /** Distinct accession numbers of the facts a derived row was computed from
+   *  (fleet #3179), in the order given; undefined when none carries one. */
+  const uniqueAccessions = (rows: Array<{ accession?: string }>): string[] | undefined => {
+    const out: string[] = [];
+    for (const r of rows) if (r.accession && !out.includes(r.accession)) out.push(r.accession);
+    return out.length > 0 ? out : undefined;
+  };
   // Does this fact's DURATION match its period label? A 10-Q files BOTH the
   // discrete 3-month quarter AND the year-to-date figure under the same
   // (fy, fp, end) tuple, filed the same day — so "most recently filed" was a
@@ -4782,6 +5067,10 @@ async function companyConcept(
       ytd: false as boolean,
       note: undefined as string | undefined,
       total_liquidity: undefined as LiquidityBreakdown | undefined,
+      // Derived rows only (fleet #3179): the filings the arithmetic read, so a
+      // computed Q2/Q3/Q4 figure is still traceable to documents. `accession`
+      // stays undefined on those rows -- no ONE filing states the number.
+      derived_from_accessions: undefined as string[] | undefined,
     }))
     .sort((a, b) => (b.period_end ?? '').localeCompare(a.period_end ?? ''));
 
@@ -4828,6 +5117,7 @@ async function companyConcept(
       form: 'derived',
       filed: fyRow.filed,
       accession: undefined, // arithmetic over FY + Q1-Q3, not a fact one filing states
+      derived_from_accessions: uniqueAccessions([fyRow, ...quarters.values()]),
       unit: fyRow.unit,
       derived: true,
       duration_days: undefined, // no period_start to compute a span from
@@ -4895,6 +5185,7 @@ async function companyConcept(
       form: 'derived',
       filed: q2ytd.filed,
       accession: undefined, // YTD(Q2) minus Q1 — spans two filings
+      derived_from_accessions: uniqueAccessions([q2ytd, q1]),
       unit: q2ytd.unit,
       derived: true,
       duration_days: spanDays(q1.period_end, q2ytd.period_end),
@@ -4917,6 +5208,7 @@ async function companyConcept(
         form: 'derived',
         filed: q3ytd.filed,
         accession: undefined, // YTD(Q3) minus YTD(Q2) — spans two filings
+        derived_from_accessions: uniqueAccessions([q3ytd, q2ytd]),
         unit: q3ytd.unit,
         derived: true,
         duration_days: spanDays(q2ytd.period_end, q3ytd.period_end),
