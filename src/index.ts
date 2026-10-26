@@ -1065,23 +1065,62 @@ function rankMatches<T>(
   query: string,
   items: T[],
   getName: (item: T) => string,
+  getAliases?: (item: T) => string[],
 ): RankedMatch<T>[] {
   const q = normalize(query);
   if (!q) return [];
   const scored: { item: T; kind: MatchKind; score: number; len: number }[] = [];
   for (const item of items) {
     const name = getName(item);
-    const n = normalize(name);
+    // `getAliases` (optional, fleet #3607) are OTHER spellings of the same name,
+    // each scored on its own; the best-scoring spelling wins. Additive on
+    // purpose: the raw name is always tried, so a query that already matched
+    // keeps matching exactly as before, and an alias can only ADD a match.
     let kind: MatchKind | null = null;
     let score = 0;
-    if (n === q) { kind = 'exact'; score = 4; }
-    else if (n.startsWith(`${q} `)) { kind = 'prefix'; score = 3; }
-    else if (n.includes(` ${q} `) || n.endsWith(` ${q}`)) { kind = 'word'; score = 2; }
-    else if (n.includes(q)) { kind = 'substring'; score = 1; }
+    for (const spelling of [name, ...(getAliases?.(item) ?? [])]) {
+      const n = normalize(spelling);
+      let k: MatchKind | null = null;
+      let sc = 0;
+      if (n === q) { k = 'exact'; sc = 4; }
+      else if (n.startsWith(`${q} `)) { k = 'prefix'; sc = 3; }
+      else if (n.includes(` ${q} `) || n.endsWith(` ${q}`)) { k = 'word'; sc = 2; }
+      else if (n.includes(q)) { k = 'substring'; sc = 1; }
+      if (k && sc > score) { kind = k; score = sc; }
+    }
     if (kind) scored.push({ item, kind, score, len: name.length });
   }
   scored.sort((a, b) => b.score - a.score || a.len - b.len);
   return scored.map(({ item, kind, score }) => ({ item, kind, score }));
+}
+
+/**
+ * The trailing designators EDGAR appends to a registrant name that are NOT part
+ * of the company's name: state or country of incorporation ("/DE/", "/MD",
+ * "/CAN/", "/Cayman"), "/NEW", and the ADR marker. Matched case-insensitively
+ * against the WHOLE segment after the last slash, so a name with a slash INSIDE
+ * it ("CULLEN/FROST BANKERS", "M/I HOMES", "Quad/Graphics", "DATA I/O CORP",
+ * "GENMAB A/S") is never cut. A genuine legal form that happens to look like a
+ * 2-letter designator ("Anheuser-Busch InBev SA/NV") gains an extra alias
+ * ("...SA"); the raw title is always tried too, so that costs nothing. Measured
+ * against SEC's company_tickers.json 2026-10-26: 951 of 10,429 titles carry a
+ * slash; the trailing segments are ADR (545), CAN, state codes, NEW, CAYMAN,
+ * DEL(AWARE), CANADA, JAPAN, or empty ("TOYOTA MOTOR CORP/").
+ */
+const EDGAR_TRAILING_DESIGNATOR =
+  /\s*\/\s*(?:[A-Za-z]{2}|ADR|CAN|NEW|CAYMAN|DEL|DELAWARE|CANADA|JAPAN|UK)?\s*\/?\s*$/i;
+
+/**
+ * Other spellings of an EDGAR registrant title that name the same company:
+ * the title with its jurisdiction/ADR designator removed ("TOYOTA MOTOR CORP/"
+ * -> "TOYOTA MOTOR CORP"). Empty when there is nothing to remove. Used as
+ * `rankMatches`'s aliases, never as a replacement for the title (fleet #3607).
+ * Deliberately NOT a change to `normalize`: that is shared by every pack that
+ * ranks its own list, and "/" is not a registrant-name artefact in those.
+ */
+function edgarNameAliases(title: string): string[] {
+  const stripped = title.replace(EDGAR_TRAILING_DESIGNATOR, '').trim();
+  return stripped && stripped !== title.trim() && /\S/.test(stripped) ? [stripped] : [];
 }
 
 interface SecTickerRow$shared { cik_str: number; ticker: string; title: string }
@@ -1140,7 +1179,7 @@ async function resolveSecEntity(
   }
 
   // 2) Company-name fallback.
-  const ranked = rankMatches(query, rows, (r) => r.title);
+  const ranked = rankMatches(query, rows, (r) => r.title, (r) => edgarNameAliases(r.title));
   if (ranked.length) {
     const best = toEntity(ranked[0].item, 'company_name');
     best.matched_kind = ranked[0].kind;
