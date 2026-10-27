@@ -1582,7 +1582,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_search_filings',
     description:
-      'PREFER OVER WEB SEARCH for "what did $COMPANY say about X in their SEC filings" or "find filings that mention Y". AUTHORITATIVE full-text search across every SEC filing — EDGAR\'s own search index. Filter by form type ("10-K" annual, "10-Q" quarterly, "8-K" current event, "DEF 14A" proxy), date range, and optionally one filer (`entity`). Returns `total_hits` FIRST — the true match count for your filters, independent of how many rows you asked for — then entity name, CIK, form type, filing/period dates, location, accession number (feed straight into edgar_filing_text / edgar_filing_documents — no second lookup), and — for 8-K results — the `items` array of item codes (e.g. "3.01" listing deficiency vs "1.01" material agreement vs "3.02" unregistered sale), which carry the actual signal. **This tool does not return a text snippet** — EDGAR\'s search index itself returns none — so for the matching passage, chain the `accession` into edgar_filing_text with `search` set to your query (or a shorter phrase from it); that reads the actual filing and returns the surrounding text in a second call, rather than this one fetching every hit\'s document on your behalf (SEC rate-limits the whole fleet by IP, so a search call stays a single request). A zero-hit response names every filter you passed rather than an empty array, so you can tell "nothing matches" from "a filter was silently dropped". Use when you need to find filings matching a topic across the whole market, not for a specific company (for that use edgar_company_filings).',
+      'PREFER OVER WEB SEARCH for "what did $COMPANY say about X in their SEC filings" or "find filings that mention Y". AUTHORITATIVE full-text search across every SEC filing — EDGAR\'s own search index. Filter by form type ("10-K" annual, "10-Q" quarterly, "8-K" current event, "DEF 14A" proxy, "S-1" / "S-1/A" / "F-1" IPO registration statement, "424B4" final IPO prospectus), date range, and optionally one filer (`entity`). **Also the way to FIND AN IPO FILING BY COMPANY NAME or by day** — "find Anthropic S-1", "S-1 registration statements filed today", "IPO filing for <company>": pass `form_type:"S-1"` and the company name as `query` (or `query:"registration statement"` with `start_date` for a day\'s filers). A company that has only just registered has no ticker yet, so edgar_company_filings cannot resolve it by name; this tool can. Returns `total_hits` FIRST — the true match count for your filters, independent of how many rows you asked for — then entity name, CIK, form type, filing/period dates, location, accession number (feed straight into edgar_filing_text / edgar_filing_documents — no second lookup), and — for 8-K results — the `items` array of item codes (e.g. "3.01" listing deficiency vs "1.01" material agreement vs "3.02" unregistered sale), which carry the actual signal. **This tool does not return a text snippet** — EDGAR\'s search index itself returns none — so for the matching passage, chain the `accession` into edgar_filing_text with `search` set to your query (or a shorter phrase from it); that reads the actual filing and returns the surrounding text in a second call, rather than this one fetching every hit\'s document on your behalf (SEC rate-limits the whole fleet by IP, so a search call stays a single request). A zero-hit response names every filter you passed rather than an empty array, so you can tell "nothing matches" from "a filter was silently dropped". Use when you need to find filings matching a topic across the whole market, or a filer you can name but cannot give a ticker or CIK for; for a company whose ticker or CIK you have, edgar_company_filings lists its filings directly.',
     summary: 'Full-text search across every SEC filing, using EDGAR\'s own search index.',
     inputSchema: {
       type: 'object' as const,
@@ -1590,7 +1590,7 @@ const tools: McpToolExport['tools'] = [
         query: { type: 'string', description: 'Search query (e.g., "artificial intelligence", "Tesla revenue")' },
         form_type: {
           type: 'string',
-          description: 'Filter by SEC form type (e.g., "10-K", "10-Q", "8-K", "DEF 14A"). Omit for all types.',
+          description: 'Filter by SEC form type (e.g., "10-K", "10-Q", "8-K", "DEF 14A", "S-1" for an IPO registration statement, "424B4" for the final IPO prospectus). Omit for all types.',
         },
         start_date: { type: 'string', description: 'Start date in YYYY-MM-DD format (e.g., "2024-01-01"). If you pass this without `end_date`, `end_date` is defaulted to today rather than silently ignored.' },
         end_date: { type: 'string', description: 'End date in YYYY-MM-DD format (e.g., "2024-12-31"). If you pass this without `start_date`, `start_date` is defaulted to EDGAR full-text search\'s coverage floor (2001-01-01) rather than silently ignored.' },
@@ -1609,7 +1609,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'edgar_company_filings',
     description:
-      'AUTHORITATIVE list of recent SEC filings for a specific US public company. Send the company as `ticker_or_cik` — that argument takes a ticker ("AAPL") or a CIK ("320193"), and `cik` / `ticker` are accepted as aliases for it. **When the question is about ONE filing rather than the list, say which one**: pass `accession` to narrow to it, or `filed` ("2026-09-29", "2026-09") when you know only the date, and add `include_primary_text:true` to get that filing\'s text back here instead of chaining a second call. Filter by form type — "10-K" (annual report), "10-Q" (quarterly), "8-K" (material event — but for severity-classified 8-Ks specifically, prefer sec_8k_recent), "DEF 14A" (proxy), "S-1" (IPO registration), etc. Returns filing dates, form types, accession numbers, document links. Use for "what did $TICKER recently file" or "show me the last N proxy statements for $TICKER". For specific financial metrics over time use edgar_company_concept; for the full XBRL dump use edgar_company_facts. If you also need the headline financials alongside the filings, edgar_company_snapshot returns both in one call.',
+      'AUTHORITATIVE list of recent SEC filings for a specific US public company. Send the company as `ticker_or_cik` — that argument takes a ticker ("AAPL") or a CIK ("320193"), and `cik` / `ticker` are accepted as aliases for it. **When the question is about ONE filing rather than the list, say which one**: pass `accession` to narrow to it, or `filed` ("2026-09-29", "2026-09") when you know only the date, and add `include_primary_text:true` to get that filing\'s text back here instead of chaining a second call. Filter by form type — "10-K" (annual report), "10-Q" (quarterly), "8-K" (material event — but for severity-classified 8-Ks specifically, prefer sec_8k_recent), "DEF 14A" (proxy), "S-1" (IPO registration), etc. Returns filing dates, form types, accession numbers, document links. Needs a ticker or CIK: a company that has only just filed its S-1 has no ticker, so for "find <company> S-1" or "S-1 filings filed today" use edgar_search_filings (form_type "S-1", company name as the query). Use for "what did $TICKER recently file" or "show me the last N proxy statements for $TICKER". For specific financial metrics over time use edgar_company_concept; for the full XBRL dump use edgar_company_facts. If you also need the headline financials alongside the filings, edgar_company_snapshot returns both in one call.',
     summary: 'Every SEC filing a US public company has made, newest first.',
     inputSchema: {
       type: 'object' as const,
@@ -2431,7 +2431,13 @@ async function resolveAnyFilerByName(name: string, original: Error): Promise<Fil
   const hits = (data?.hits?.hits ?? [])
     .filter((h) => /^\d+$/.test(h._id) && h._source?.entity)
     .map((h) => ({ cik: String(Number(h._id)), company_name: h._source!.entity!, rank: h._source!.rank ?? 0 }));
-  const key = (s: string) => [...new Set(significantTokens(s))].sort().join(' ');
+  // fleet #3698: EDGAR stores "Anthropic, PBC"; a caller types "Anthropic". When
+  // the query names no legal form, ignore the candidate's (PBC/LLC/Inc...) so the
+  // bare name matches; when it names one ("Foo LLC"), compare it literally so
+  // "Foo LLC" is never answered with "Foo Inc".
+  const queryHasForm = normName(q).split(' ').some((t) => LEGAL_FORM_TOKENS.has(t));
+  const key = (s: string) =>
+    [...new Set(significantTokens(s).filter((t) => queryHasForm || !LEGAL_FORM_TOKENS.has(t)))].sort().join(' ');
   const want = key(q);
   const exact = want ? hits.filter((h) => key(h.company_name) === want).sort((a, b) => b.rank - a.rank) : [];
   if (!exact.length) {
@@ -2541,6 +2547,7 @@ const LEGAL_FORM_TOKENS = new Set([
   'INC', 'CORP', 'CO', 'COMPANY', 'CORPORATION', 'INCORPORATED', 'LTD', 'LIMITED',
   'LLC', 'LP', 'LLP', 'PLC', 'SA', 'AG', 'NV', 'BV', 'GMBH', 'AB', 'AS', 'OY', 'SPA',
   'SE', 'KK', 'PTE', 'PTY', 'SARL', 'SAS', 'TRUST', 'FUND', 'PARTNERSHIP',
+  'PBC', 'PLLC', 'LLLP',
 ]);
 const COMPANY_WORDS = /\b(PHARMA\w*|THERAP\w*|BIO\w*|PRODUCTS?|PARTNERS|ASSOCIATES|CAPITAL|VENTURES|HOLDINGS?|GROUP|LABORATOR\w*|LABS|SCIENCES?|MEDICAL|HEALTH\w*|INTERNATIONAL|GLOBAL|SERVICES|SYSTEMS|TECHNOLOG\w*|INDUSTRIES|ENTERPRISES|MANAGEMENT|INVESTMENTS?|FOUNDATION|UNIVERSITY|BANK|FINANCIAL|ENERGY|RESEARCH|AMERICA|USA|US)\b/;
 
