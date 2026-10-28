@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-edgar",
-  "version": "0.3.17",
+  "version": "0.4.0",
   "description": "EDGAR MCP — SEC EDGAR public APIs (free, no auth)",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-edgar": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "edgar"],
   "license": "MIT",
@@ -14,19 +22,11 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-edgar.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/edgar",
   "pipeworx": {
-    "sourceHash": "v1-eb6d20c2a6d8a7f6285027f18ace5103ebe9a755bcb8c27c5da4aef30c92bb7c",
-    "sourceCommit": "ba9dd6df5992aeb16ef2425ee86d1752c34ca636"
+    "mode": "gateway",
+    "slug": "edgar",
+    "sourceHash": "v1-946d58708d52d4101eca43c683b5fed195a5d39ba5dbc865b29c019051c9ee0a",
+    "sourceCommit": "9e85a257cbe006237b108ab579a1ab44a23ccbb1"
   }
 }
