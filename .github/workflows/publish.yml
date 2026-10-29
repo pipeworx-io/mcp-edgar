@@ -180,6 +180,8 @@ jobs:
       # uses), but only a gateway-mode pack's server.json has a `packages`
       # entry to add; every other pack reads mode=local below and exits.
       - name: List on the MCP Registry with npm packages entry (gateway-mode packs)
+        # Bounded: the mcpName wait below is at most ~10 minutes by default.
+        timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -194,20 +196,48 @@ jobs:
           slug=$(node -p "require('./package.json').pipeworx.slug")
           server_name="io.github.pipeworx-io/$slug"
 
-          # The registry's own npm validator fetches the SAME npm index we
-          # just published to, which can lag a publish by a few seconds
-          # (its own 404 error message says so: "A newly published release
-          # can take a moment to appear ... wait and retry"). Wait for it to
-          # agree rather than racing it.
+          # The registry's own npm validator fetches <name>/<version> from
+          # registry.npmjs.org and requires its mcpName to match. A fresh
+          # publish is NOT there immediately: npm's own publish output says
+          # "Your package is being processed and may take a few minutes to
+          # become available". The old wait here was 6 x 5s through
+          # `npm view`, which also reads the npm CLI's local cache -- and the
+          # "Skip if this version is already published" step above had just
+          # cached this package's packument WITHOUT the new version (the
+          # registry serves it max-age=300). On edgar 0.4.0 (fleet #3761) the
+          # wait expired and the listing was left absent until a manual
+          # re-run a minute later. So: ask the registry directly, uncached,
+          # at the same per-version URL the validator reads, for up to
+          # MCPNAME_WAIT_TRIES x MCPNAME_WAIT_SECONDS (default 40 x 15s = 10
+          # min), and if it still disagrees, FAIL this step. A missing
+          # listing is the silent outcome this step exists to prevent; a red
+          # run is what makes it visible, and "Re-run failed jobs" retries it
+          # (the publish step skips an already-published version).
+          tries="${MCPNAME_WAIT_TRIES:-40}"
+          pause="${MCPNAME_WAIT_SECONDS:-15}"
+          npm_registry="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
           mcpname=""
-          for i in 1 2 3 4 5 6; do
-            mcpname=$(npm view "$name@$version" mcpName 2>/dev/null || true)
-            [ "$mcpname" = "$server_name" ] && break
-            sleep 5
+          for i in $(seq 1 "$tries"); do
+            mcpname=$(node -e '
+              const [registry, name, version] = process.argv.slice(1);
+              fetch(`${registry}/${name}/${version}`, {
+                headers: { accept: "application/json", "cache-control": "no-cache" },
+                cache: "no-store",
+              }).then(async (r) => {
+                if (!r.ok) return;
+                const j = await r.json();
+                if (j && typeof j.mcpName === "string") process.stdout.write(j.mcpName);
+              }).catch(() => {});
+            ' "$npm_registry" "$name" "$version" 2>/dev/null || true)
+            if [ "$mcpname" = "$server_name" ]; then
+              echo "npm serves $name@$version with mcpName=$server_name (check $i of $tries)"
+              break
+            fi
+            if [ "$i" -lt "$tries" ]; then sleep "$pause"; fi
           done
           if [ "$mcpname" != "$server_name" ]; then
-            echo "::warning::npm does not report mcpName=$server_name for $name@$version yet after waiting -- leaving the MCP Registry listing as-is (remotes-only, or absent); re-run this workflow to retry"
-            exit 0
+            echo "::error::npm still does not serve $name@$version with mcpName=$server_name after $tries checks ${pause}s apart (last saw: ${mcpname:-nothing}) -- the MCP Registry listing was NOT created. Re-run this workflow's failed job to retry; the npm publish itself is done and will be skipped."
+            exit 1
           fi
 
           node -e '
